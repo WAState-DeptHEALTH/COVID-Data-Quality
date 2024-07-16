@@ -1,0 +1,709 @@
+#################################################################################################
+#  WDRS PULL AND RAW R OBJECT SAVE
+#  PULLING DATA OUT OF THE DATABSE AND SAVING THE R OBJECTS FOR COVID-19 R OBJECT DATASET CREATION PART 2
+################################################################################################
+################################################################################################
+#
+#  This R Markdown script pulls data from the live COVID-19 database (WDRS), and saves the data as .Rdata files for each table
+#  in the database we want to make into a standardized dataset. The .Rdata files are saved in shared locations for a variety of Washington State DOH teams to access. 
+#  
+#
+#  **IMPORTANT ACRONYMS/PHRASES USED:**
+#     -WDRS: Washington Disease Reporting System (the primary database for COVID-19 disease reporting information)
+#     -db: database
+#     -df: dataframe; a way to structure data within the base functions of R
+#     -R Object: a set of .RData files with cleaned COVID-19 data to use as a more reliable/static dataset to pull data from compared to the live databse WDRS 
+#     -spectable: a table looking at specimen collection specifically 
+#
+#
+#  This script is helpful to external DOH partners as it demonstrates how to create a standardized dataset for all cases to use as an alternative to querying a live database.
+#  
+################################################################################################
+################################################################################################
+
+
+---
+  title: "WDRS_pull"
+output: 
+  html_document:
+  self_contained: no
+date: "2022-09-21"
+---
+  
+  ```{r setup2, include=FALSE, results="hide"}
+knitr::opts_chunk$set(echo = TRUE)
+```
+
+#This script should connect to the WDRS server and pull down data to be further manipulated in R. Each chunk of code should be a separate pull. 
+# Only minimal, if any, data manipulation should be done in this code (such as date formatting). Raw objects should then be saved. The file pathway for these raw objects should be set in the main afternoon and morning scripts and then referenced here. 
+# (if needed, for testing purposes, a copy of the file pathway can be added to this code). Please name the chunks so they can be called individually by the main code.
+
+# WDRS Summary
+#WDRS is an electronic disease surveillance system that allows public health staff in Washington State to receive, enter, manage, process, track, and analyze disease related data from various sources. 
+# Most often, a WDRS event contains information about the association of a person with a disease or other health condition. One person can be associated with one or more real world events, each being represented by a separate event in WDRS. 
+#In this case we are connecting to WDRS to pull information regarding COVID-19. WDRS is a live surveillance system which is updated in real time. A copy or 'replica database' of WDRS exists which is an exact copy of the live database which is refreshed roughly every 20-30 minutes. 
+# To prevent any issues which may arise when pulling information from a live surveillance system we instead pull from the replica database. 
+# Therefore, when there is any future mention of connecting to or pulling from WDRS we are pulling from the replica database.
+
+#As mentioned above WDRS contains disease related data which is associated with a person. Given the wide variety in the types of information which can pertain to a person, a case, or a lab, this information is often stored in different locations on the database. 
+# These different locations are called denormalized tables in WDRS. Often they are referred to as just tables.
+
+# Set WDRS connection
+#The code below sets the connection between R and WDRS. This is done through ODBC (Open Database Connectivity) set up through Microsoft SQL Server. 
+
+```{r connect_to_wdrs}
+wdrs <- DBI::dbConnect(odbc::odbc(),
+                       Driver = "SQL Driver",
+                       Server = "Server",
+                       Database = "WDRS",
+                       Trusted_connection = "yes",
+                       ApplicationIntent= "ReadOnly",
+                       Timeout=120)
+```
+#lloking at the last time the live table was refreshed
+```{r last_lab_refresh}
+lab_table_time <- dbGetQuery(wdrs,"
+                    select top 1 investigation_modification_date as lab_table_time
+                    from dd_gcd_covid19_lab order by investigation_modification_date desc")
+
+lab_table_time$lab_table_time <- force_tz(lab_table_time$lab_table_time, tzone= "America/Los_Angeles",roll = TRUE)
+
+lab_rows <- dbGetQuery(wdrs,"
+                    select count(*) as lab_rows
+                    from dd_gcd_covid19_lab")
+
+lab_qa <- cbind(lab_table_time, lab_rows)
+
+save(lab_qa, file =paste0(GITDIR,"filepath.RData"))
+```
+
+# SpecTable Pull
+#Pull of information for the SpecTable surveillance object
+#SpecTable contains test level data from the DD_GCD_COVID19_LAB table after removing cases marked for deletion and labs outside of the time frame of interest.
+```{r SpecTable_pull}
+SpecTable <-dbGetQuery(wdrs, paste0("select
+     [CASE_ID],
+     [WELRS__ID],
+     [UNID],
+     [CREATE_DATE],
+     [WELRS__ASSIGN__ADDR__TYPE],
+     [WELRS__GEOCODED__LATITUDE],
+     [WELRS__GEOCODED__LONGITUDE],
+     [WELRS__GEOCODED__MATCH__SOURCE],
+     [WELRS__GEOCODED__MATCH__ACCURACY],
+     [SPECIMEN__COLLECTION__DTTM],
+     [SPECIMEN__TYPE],
+     [WDRS__RESULT__SUMMARY],
+	   [WDRS__RESULT],
+     [PATIENT__ADDRESS_1],
+     [PATIENT__ADDRESS_2],
+     [PATIENT__ADDRESS__CITY],
+     [PATIENT__ADDRESS__STATE],
+     [PATIENT__ADDRESS__ZIP],
+     [PATIENT__ADDRESS__TYPE],
+     [PATIENT__ADDRESS__TYPE__WDRS],
+     [INVESTIGATION_CREATE_DATE],
+     [WDRS__TEST__PERFORMED],
+     [FIRST_NAME],
+     [LAST_NAME],
+     [SUBMITTER],
+     [WELRS__ASSIGNED__COUNTY],
+	   [RESULT__REPORT__DTTM],
+	   [ANALYSIS__DTTM],
+	   [OBSERVATION__DTTM],
+	   [PERFORMING__LAB__ENTIRE__REPORT__OTHER],
+	   [ORDFAC__NAME],
+	   [WELRS__PROCESSED__DTTM],
+	   [STATUS],
+     [TEST__METHOD],
+     [WDRS__PERFORMING__ORG],
+	   [FILLER__ORDER__NUM]
+     FROM DD_GCD_COVID19_LAB
+     WHERE CODE='SARS' AND STATUS!=6 AND    
+     (SPECIMEN__COLLECTION__DTTM >=", "'" ,filter_dttm, "'
+     OR SPECIMEN__COLLECTION__DTTM IS NULL
+     OR SPECIMEN__COLLECTION__DTTM <", "'", pandemic_start_date, "')"))
+
+# There are a lot of variables with 'DTTM' attached that are not datetimes but just dates. Ex. SPECIMEN_COLLECTION_DTTM.
+# Changing the timezone to PST
+SpecTable$CREATE_DATE <- force_tz(SpecTable$CREATE_DATE, tzone= "America/Los_Angeles",roll = TRUE)
+
+SpecTable$INVESTIGATION_CREATE_DATE <- force_tz(SpecTable$INVESTIGATION_CREATE_DATE, tzone= "America/Los_Angeles",roll = TRUE)
+
+SpecTable<- SpecTable %>% mutate(WELRS__PROCESSED__DTTM = as.Date(WELRS__PROCESSED__DTTM, "%m/%d/%Y"))
+
+# Remove cases with an investigation create date today
+
+SpecTable <- SpecTable %>% filter(as.Date(INVESTIGATION_CREATE_DATE, format = "%Y-%m-%d") != Sys.Date()) 
+
+SpecTable$INVESTIGATION_CREATE_DATE <-as.Date(SpecTable$INVESTIGATION_CREATE_DATE)
+
+SpecTable <- SpecTable %>% filter(!is.na(INVESTIGATION_CREATE_DATE))
+
+save(SpecTable, file = paste0(diqa_path,"filepath.RData"))
+
+```
+
+# Note the last time the COVID-19 flattened table was refreshed
+```{r last_flat_refresh}
+wdrs_flat_time <- dbGetQuery(wdrs,"
+                    select top 1 modification_date as wdrs_flat_time
+                    from dd_gcd_covid_19_flattened order by modification_date desc")
+
+wdrs_flat_time$wdrs_flat_time <- force_tz(wdrs_flat_time$wdrs_flat_time, tzone= "America/Los_Angeles",roll = TRUE)
+
+flat_rows <- dbGetQuery(wdrs,"
+                    select count(*) as flat_rows
+                    from dd_gcd_covid_19_flattened")
+
+flat_qa <- cbind(wdrs_flat_time, flat_rows)
+
+save(flat_qa, file =paste0(GITDIR,"filepath.RData"))
+```
+
+# GCD_COVID_19 pull
+#Pull of information for the GCD_COVID_19 surveillance object
+#GCD_COVID_19 contains case level data from the DD_GCD_COVID19_FLATTENED table after removing cases marked for deletion and cases outside of the time frame of interest.
+```{r GCD_COVID_19_pull}
+GCD_COVID_19<- dbGetQuery(wdrs, paste0("SELECT 
+                                        CASE_ID,
+                                        EXTERNAL_ID,
+                                        STATUS,
+                                        LAST_NAME, 
+                                        FIRST_NAME, 
+                                        AGE_YEARS, 
+                                        ACCOUNTABLE_COUNTY, 
+                                        SEX_AT_BIRTH, 
+                                        DIED_ILLNESS, 
+                                        LIVING_STATUS,
+                                        DIED_ILLNESS_REPORT,
+                                        HOSPITALIZED_LEAST_OVERNIGHT_ILLNESS, 
+                                        HOSPITALIZED_LEAST_OVERNIGHT_ILLNESS_FACILITY_NAME,
+                                        HOSPITALIZED_LEAST_OVERNIGHT_ILLNESS_FACILITY_NAME_SPECIFY,
+                                        CDC_EVENT_DATE, 
+                                        DOH_CASE_CLASSIFICATION_REPORTING,
+                                        STATE, 
+                                        TEN_DAYS_PATIENT_HEALTHCARE_SETTING, 
+                                        TEN_DAYS_PATIENT_HEALTHCARE_SETTING_START_DATE_TYPE_FACILITY,
+                                        CDC_EVENT_DATE_SARS,
+                                        CREATE_DATE,
+                                        DEATH_DATE,
+                                        BIRTH_DATE as DOB,
+                                        CDC_N_COV_2019_TEN_DAYS_PATIENT_HEALTHCARE_SETTING_LTCF,
+                                        CDC_N_COV_2019_TEN_DAYS_PATIENT_HEALTHCARE_SETTING_LTCF_NAME,
+                                        BIRTH_DATE,
+                                        SYMPTOM_ONSET_DATE,
+                                        CHRONIC_LUNG_DISEASE_EG,
+                                        CHRONIC_LIVER_DISEASE,
+                                        CHRONIC_KIDNEY_DISEASE,
+                                        CARDIAC_DISEASE, 
+                                        OCCUPATION,
+                                        OCCUPATION_TYPE,
+                                        DIABETES,
+                                        OCCUPATION_EMPLOYER,
+                                        OCCUPATION_BUSINESS_TYPE,
+                                        WORK_NAME,
+                                        ANY_UNDERLYING_MEDICAL_CONDITION,
+                                        IMMUNOSUPPRESSIVE_THERAPY_DISEASE,
+                                        AGE_MONTHS,
+                                        ANY_UNDERLYING_MEDICAL_CONDITION_SPECIFY,
+                                        
+                                        CDC_N_COV_2019_DGMQ_ID,
+                                        CDC_N_COV_2019_HOSPITALIZED_ADMISSION_DATE,
+                                        CDC_N_COV_2019_HOSPITALIZED_DISCHARGE_DATE,
+                                        CDC_N_COV_2019_HOSPITALIZED_ICU,
+                                        CDC_N_COV_2019_HOSPITALIZED_MECHANICAL_VENTILATION_INTUBATION_REQUIRED,
+                                        CDC_N_COV_2019_NCOV_ID,
+                                        CDC_N_COV_2019_OTHER_TRAVEL,
+                                        CDC_N_COV_2019_OTHER_TRAVEL_DESCRIBE,
+                                        CASE_COMPLETE_DATE,
+                                        EVER_RECEIVED_VACCINE_BREAKTHROUGH_CASE,
+                                        CDC_N_COV_2019_SEQUENCE_SPECIMEN,
+                                        CDC_N_COV_2019_SEQUENCE_VARIANT_OPEN_TEXT,
+                                        CDC_N_COV_2019_SEQUENCE_STATUS,
+                                        CDC_N_COV_2019_SEQUENCE_SPECIMEN_COLLECTION_DATE,
+                                        CDC_C_COV_2019_HAI_CROSS_MATCH_STATUS,
+                                        CDC_N_COV_2019_HAI_MATCH_FOUND,
+                                        INVESTIGATION_STATUS,
+                                        INVESTIGATION_STATUS_UNABLE_TO_COMPLETE_REASON,
+                                        CDC_N_COV_2019_TESTING_CHEST_XRAY,
+                                        CDC_N_COV_2019_TESTING_LEGIONELLA,
+                                        CDC_N_COV_2019_TESTING_OTHER1,
+                                        CDC_N_COV_2019_TESTING_OTHER1_DESCRIBE,
+                                        CDC_N_COV_2019_TESTING_PNEUMONIA,
+                                        CDC_N_COV_2019_TESTING_RAPID_FLU_A,
+                                        CDC_N_COV_2019_TESTING_RAPID_FLU_B,
+                                        CDC_N_COV_2019_TRAVEL_MAINLAND_CHINA,
+                                        CDC_N_COV_2019_TRAVEL_TO_WUHAN,
+                                        CDC_NOTIFICATION_FILE_TIMESTAMP,
+                                        CHRONIC_HEART_DISEASE,
+                                        CORYZA,
+                                        CURRENT_SMOKER,
+                                        ETHNICITY,
+                                        INVESTIGATOR,
+                                        IS_PATIENT_HEALTH_CARE_WORKER_HCW,
+                                        OTHER_SYMPTOMS_SPECIFY,
+                                        POSITIVE_DEFINING_LAB_DATE,
+                                        PREGNANCY_STATUS,
+                                        RACE_AGGREGATED,
+                                        RACE_EXTENDED,
+                                        RACE_AI_OR_AN,
+                                        RACE_AMERICAN_INDIAN_OR_ALASKA_NATIVE,
+                                        RACE_ASIAN,
+                                        RACE_BLACK_OR_AFRICAN_AMERICAN,
+                                        RACE_DECLINED,
+                                        RACE_NATIVE_HAWIAIIAN_OR_OTHER_PACIFIC_ISLANDER,
+                                        RACE_NH_OR_PI,
+                                        RACE_OTHER_RACE,
+                                        RACE_OTHER_RACE_SPECIFY,
+                                        RACE_UNKNOWN,
+                                        RACE_WHITE,
+                                        SUSPECTED_EXPOSURE_SETTING,
+                                        TEN_DAYS_PATIENT_HEALTHCARE_SETTING_START_DATE_TYPE_EXPOSURE,
+                                        CDC_N_COV_2019_HOSPITALIZED,
+                                  
+                                        POSITIVE_DEFINING_LAB_DATE_SARS,
+                                        ADDRESS_LINE1,
+                                        CITY,
+                                        POSTAL_CODE,
+                                        RESIDENCE_TYPE,
+                                        POSITIVE_PCR_LAB_DATE_COVID19,
+                                        CDC_N_COV_2019_HOSPITALIZED_FACILITY_NAME,
+                                        MIDDLE_NAME,
+                                        CDC_N_COV_2019_HOSPITALIZED_RHINO_HOSPITALIZED,
+                                        CDC_N_COV_2019_HOSPITALIZED_RHINO_ID_V2,
+                                        CDC_N_COV_2019_HOSPITALIZED_RHINO_DATETIME,
+                                        CDC_N_COV_2019_HOSPITALIZED_RHINO_FACILITY_NAME,
+                                        CDC_N_COV_2019_HOSPITALIZED_RHINO_VISIT_DATE,   
+                                        CDC_N_COV_2019_HOSPITALIZED_RHINO_NOTE_V2,
+                                        HOSPITALIZED_LEAST_OVERNIGHT_ILLNESS_FACILITY_NAME_HOSPITAL_ADMISSION_DATE,
+                                        HOSPITALIZED_LEAST_OVERNIGHT_ILLNESS_FACILITY_NAME_HOSPITAL_DISCHARGE_DATE,
+                                        HOSPITALIZED_LEAST_OVERNIGHT_ILLNESS_FACILITY_NAME_ADMITTED_ICU,
+                                        HOSPITALIZED_LEAST_OVERNIGHT_ILLNESS_FACILITY_NAME_ADMITTED_ICU_MECHANICAL_VENTILATION_INTUBATION_REQUIRED,
+                                        REPORTING_ADDRESS,
+                                        REPORTING_CITY,
+                                        REPORTING_STATE,
+                                        REPORTING_ZIPCODE,
+                                        DATE_INTERVIEW_ATTEMPT,
+                                        DATE_INTERVIEW_ATTEMPT_OUTCOME,
+                                        DATE_INTERVIEW_ATTEMPT_OUTCOME_UNABLE_TO_REACH_CASECONTACT_SPECIFY,
+                                        PATIENT_NOT_BE_INTERVIEWED,
+                                        CDC_N_COV_2019_EDRS_ID,
+                                        CDC_N_COV_2019_LNI_DATA_AVAILABLE,
+                                        CDC_N_COV_2019_LNI_DATETIME,
+                                        CDC_N_COV_2019_LNI_OCCUPATION_CODE_SOC2010,
+                                        CDC_N_COV_2019_LNI_OCCUPATION_TITLE,
+                                        CDC_N_COV_2019_LNI_INDUSTRY_CODE_NAICS2007,
+                                        CDC_N_COV_2019_LNI_INDUSTRY_TITLE,
+                                        IO_NIOCCS_DATA_AVAILABLE,
+                                        IO_NOICSS_DATETIME,
+                                        IO_CODING_SCHEME,
+                                        IO_NAICS_TITLE,
+                                        IO_NAICS_CODE,
+                                        IO_NAICS_PROB,
+                                        IO_SOC_TITLE,
+                                        IO_SOC_CODE,
+                                        IO_SOC_PROB,
+                                        IO_CENSUS_IND_TITLE,
+                                        IO_CENSUS_IND_CODE,
+                                        IO_CENSUS_OCC_TITLE,
+                                        IO_CENSUS_OCC_CODE,
+                                        CDC_N_COV_2019_HAI_MATCH_SCORE,
+                                        CDC_N_COV_2019_HAI_PARTY_UNID,
+                                        CDC_N_COV_2019_HAI_PARTY_COUNTY,
+                                        CDC_N_COV_2019_HAI_PARTY_CITY,
+                                        CDC_N_COV_2019_HAI_PARTY_STATE,
+                                        CDC_N_COV_2019_HAI_PARTY_TYPE,
+                                        CDC_N_COV_2019_HAI_ENTERED_FACILITY_NAME,
+                                        CDC_N_COV_2019_HAI_ENTERED_COUNTY,
+                                        CDC_N_COV_2019_HAI_ENTERED_CITY,
+                                        CDC_N_COV_2019_HAI_ENTERED_STATE,
+                                        CDC_N_COV_2019_HAI_ENTERED_FACILITY_TYPE,
+                                        CDC_N_COV_2019_HAI_ENTERED_TYPE_SPECIFY,
+                                        ANY_FEVER_SUBJECTIVE_MEASURED,
+                                        ANY_FEVER_SUBJECTIVE_MEASURED_TEMPERATURE_KNOWN,
+                                        ANY_FEVER_SUBJECTIVE_MEASURED_TEMPERATURE_KNOWN_HIGHEST,
+                                        CHILLS,
+                                        HEADACHE,
+                                        MYALGIA,
+                                        PHARYNGITIS,
+                                        CDC_N_COV_2019_CONGESTION,
+                                        COUGH,
+                                        COUGH_PRODUCTIVE,
+                                        COUGH_DRY,
+                                        DIFFICULTY_BREATHING,
+                                        DYSPNEA,
+                                        PNEUMONIA,
+                                        ACUTE_RESPIRATORY_DISTRESS_SYNDROME,
+                                        ACUTE_RESPIRATORY_DISTRESS_SYNDROME_DIAGNOSED_BY,
+                                        NAUSEA,
+                                        VOMITING,
+                                        DIARRHEA,
+                                        ABDOMINAL_PAIN,
+                                        CDC_N_COV_2019_ANOSMIA,
+                                        CDC_N_COV_2019_DYSGEUSIA_AGEUSIA,
+                                        OTHER_SYMPTOMS,
+                                        COMPLAINANT_ILL,
+                                        POSITIVE_AG_LAB_DATE_COVID19,
+                                        POSITIVE_PCR_EXISTS_COVID19,
+                                        POSITIVE_AG_EXISTS_COVID19,
+                                        LANGUAGE,
+                                        CDC_N_COV_2019_DEATH_CERTIFICATE_NUMBER,
+                                        SSN,
+                                        REINFECTION_FLAG,
+                                        REINFECTION_FLAG_PREVIOUS_CASE_ID,
+                                        MODIFICATION_DATE,
+                                        CDC_N_COV_2019_SEQUENCE_REASON,
+                                        CDC_N_COV_2019_SEQUENCE_SGTF,
+                                        DEATH_RECENT_INFECTION,
+                                        CASE_DEDUPLICATION_STATUS,
+                                        PERSON_DEDUPLICATION_STATUS,
+                                        CDC_N_COV_2019_SMOKE_VAPE,
+                                        ACUTE_RESPIRATORY_INFECTION_FEVER_COUGH, 
+                                        FATIGUE, 
+                                        RENAL_FAILURE, 
+                                        CDC_N_COV_2019_WHEEZING, 
+                                        CDC_N_COV_2019_CHEST_TIGHTNESS, 
+                                        ASTHMA, 
+                                        HIGH_BLOOD_PRESSURE, 
+                                        CURRENT_PRESCRIPTIONS_TREATMENT, 
+                                        CANCER_DIAGNOSIS_TREATMENT_12_MONTHS_PRIOR_ONSET, 
+                                        HEMOGLOBINOPATHY, 
+                                        CHEMOTHERAPY, 
+                                        STEROID_THERAPY, 
+                                        ORGAN_TRANSPLANT,
+                                        DOH_ANALYTIC_YEAR,
+                                        DOH_ANALYTIC_CASE_CLASSIFICATION,
+                                        DOH_ANALYTIC_EVENT_DATE,
+                                        DOH_ANALYTIC_MMWR_YEAR,
+                                        VAX_STATUS_AT_POSITIVE_TEST,
+                                        DASHBOARD_REPORTING_RACE,
+                                        DASHBOARD_REPORTING_RACE_SOURCE,
+                                        DASHBOARD_REPORTING_ETHNICITY,
+                                        DASHBOARD_REPORTING_ETHNICITY_SOURCE
+                                        FROM DD_GCD_COVID_19_FLATTENED WHERE STATUS!=6 AND
+CREATE_DATE >=", "'", pandemic_start_date, "'", " AND CREATE_DATE <=", "'", almostMidnightYesterday, "'"))
+
+# If adding a new date variable, confirm that datetime is in PST/PDT and use force_tz, roll=TRUE to convert the datetime
+# ONLY use force_tz if sys.timezone() is NOT in WDRS connection. 
+GCD_COVID_19$CREATE_DATE <- force_tz(GCD_COVID_19$CREATE_DATE, tzone= "America/Los_Angeles",roll = TRUE)
+
+GCD_COVID_19$MODIFICATION_DATE <- force_tz(GCD_COVID_19$MODIFICATION_DATE,tzone = "America/Los_Angeles",roll=TRUE)
+
+#added in formatted county info
+#Add county name to GCD_COVID_19
+# Load in county map
+CountyMap <- data.table::fread(paste0(GITDIR,"filepath.csv"),
+                               stringsAsFactors=FALSE)
+
+# Regional data
+regional_data <- read_xlsx(paste0(cross_repo_path, "County_list.xlsx"))
+regional_data <- regional_data %>% dplyr::select(COUNTY_NAME_LONG, EASTERN_WESTERN_WASHINGTON)
+CountyMap <- CountyMap %>% left_join(regional_data, by = c("County" = "COUNTY_NAME_LONG"))
+
+# fix name in CountyMap: Road to recovery region should be Road.to.recovery.region
+setDT(CountyMap)
+setnames(CountyMap,"Road to recovery region", "Road.to.recovery.region")
+
+
+#merge GCD_COVID_19 with CountyMap
+GCD_COVID_19 <- GCD_COVID_19 %>% left_join(CountyMap, by = c("ACCOUNTABLE_COUNTY" = "Code"))
+
+#rename so object name matches old version of script
+GCD_COVID_19raw <- GCD_COVID_19
+
+save(GCD_COVID_19raw, file = paste0(diqa_path,"filepath.RData"))
+
+#remove duplicate dataframe (our code always calls GCD_COVID_19)
+rm(GCD_COVID_19raw)
+
+```
+
+
+# Note the last time the COVID-19 sequencing table was refreshed
+```{r last_sequence_refresh}
+sequencing_time <- dbGetQuery(wdrs, 
+                              "SELECT top 1 create_date as sequencing_roster
+                  from IDS_EMAIL_QUEUE where subject 
+                  like '%SEQUENCING%'
+                  order by email_date desc")
+
+sequencing_time$sequencing_roster <- force_tz(sequencing_time$sequencing_roster, tzone= "America/Los_Angeles",roll = TRUE)
+
+sequencing_time2 <- dbGetQuery(wdrs,"
+                    select top 1 CASE_MODIFICATION_DATE as pull
+                    from DD_GCD_COVID19_SEQUENCING order by CASE_MODIFICATION_DATE desc")
+
+sequencing_time$pull <- force_tz(sequencing_time2$pull, tzone= "America/Los_Angeles",roll = TRUE)
+
+save(sequencing_time, file=paste0(GITDIR, "filepath.RData"))
+rm(sequencing_time2)
+```
+
+# SEQUENCE pull
+
+Pull of information for the Sequence surveillance object
+Sequence contains lab level data from the DD_GCD_COVID19_SEQUENCING table after removing cases marked for deletion, specimens who haven't been sequenced and cases outside of the time frame of interest. Because the amount of processing to create this object is minimal, formatting is included here to coerce dates and times into a usable format. 
+```{r SEQUENCE_pull}
+SEQUENCE <-dbGetQuery(wdrs, paste0("SELECT  
+                            CASE_ID,
+                            CASE_UNID,
+                            CASE_STATUS,
+                            CASE_CREATE_DATE,
+                            CASE_MODIFICATION_DATE,
+                            PARTY_EXTERNAL_ID,
+                            SEQUENCE_SGTF,
+                            SEQUENCE_SPECIMEN,
+                            SEQUENCE_DATE,
+                            SEQUENCE_REASON,
+                            SEQUENCE_LAB,
+                            SEQUENCE_STATUS,
+                            SEQUENCE_REPOSITORY,
+                            SEQUENCE_GISAID_STRAIN,
+                            SEQUENCE_GENBANK_STRAIN,
+                            SEQUENCE_GISAID_ACCESSION,
+                            SEQUENCE_GENBANK_ACCESSION,
+                            SEQUENCE_VARIANT_OPEN_TEXT,
+                            SEQUENCE_SPECIMEN_COLLECTION_DATE,
+                            SEQUENCE_NOTES,
+                            SEQUENCE_CLINICAL_ACCESSION_NUMBER
+                            FROM DD_GCD_COVID19_SEQUENCING 
+                            WHERE CASE_STATUS!=6 
+                            AND SEQUENCE_SPECIMEN = 'Yes'
+                            AND CASE_CREATE_DATE >= ", "'", pandemic_start_date, "'",
+                            " AND CASE_CREATE_DATE <=","'" ,almostMidnightYesterday,"'"))
+
+SEQUENCE$CASE_CREATE_DATE <- force_tz(SEQUENCE$CASE_CREATE_DATE, tzone= "America/Los_Angeles",roll = TRUE)
+
+SEQUENCE$CASE_MODIFICATION_DATE<- force_tz(SEQUENCE$CASE_MODIFICATION_DATE, tzone= "America/Los_Angeles",roll = TRUE)
+
+SEQUENCE<- SEQUENCE %>% 
+  mutate(CASE_CREATE_DATE = as.Date(CASE_CREATE_DATE, format="%m/%d/%Y", tz = Sys.timezone()),
+         CASE_MODIFICATION_DATE = as.Date(CASE_MODIFICATION_DATE, format="%m/%d/%Y", tz = Sys.timezone()),
+         SEQUENCE_SPECIMEN_COLLECTION_DATE = as.Date(SEQUENCE_SPECIMEN_COLLECTION_DATE, format="%m/%d/%Y", tz = Sys.timezone()))
+
+save(SEQUENCE, file = paste0(Output_tables_wdrs,"SEQUENCE.RData"))
+
+rm(SEQUENCE)
+```
+
+# Race/Ethinicity Pull
+Pull data from DRIVE and WDRS to be used for both case- and lab-level race/ethnicity enrichment
+```{r race_ethnicity_pull }
+
+# Pull race/ethnicity key-output pairs (KOPs) from the DRIVE database
+# (the DRIVE database is on the same server as WDRS, so the WDRS ODBC connection can be used)
+# Having the DRIVE data allows us to fill in missing information in WDRS - if the PID22 or PID10 value in WDRS matches a key in DRIVE, we can assign the standardized value
+
+## Ethnicity
+drive_eth_kop <- DBI::dbGetQuery(wdrs,"SELECT PID22, WDRSEthnicity
+                                          FROM DRIVEAdmin.DRIVE.Ethnicity
+                                          WHERE Active='Y' AND
+                                          WDRSEthnicity IN ('HISPANIC', 'NOT_HISPANIC')") %>%
+  mutate(WDRS__LAB__ETHNICITY = case_when(WDRSEthnicity=="HISPANIC" ~ "Hispanic or Latino",
+                                          WDRSEthnicity=="NOT_HISPANIC" ~ "Not Hispanic or Latino")) %>%
+  dplyr::select(-WDRSEthnicity)
+
+
+## Race
+drive_race_kop <- DBI::dbGetQuery(wdrs,"SELECT PID10, WDRSRace
+                                           FROM DRIVEAdmin.DRIVE.Race
+                                           WHERE Active='Y' AND 
+                                           WDRSRace in ('AI_AN', 'ASIAN', 'BLACK', 'NHOPI', 'WHITE', 'OTHER')") %>%
+  mutate(WDRS__LAB__RACE=case_when(WDRSRace=="AI_AN" ~ "American Indian or Alaska Native",
+                                   WDRSRace=="ASIAN" ~ "Asian",
+                                   WDRSRace=="BLACK" ~ "Black or African American",
+                                   WDRSRace=="NHOPI" ~ "Native Hawaiian or Other Pacific Islander",
+                                   WDRSRace=="OTHER" ~ "Other Race",
+                                   WDRSRace=="WHITE" ~ "White")) %>%
+  dplyr::select(-WDRSRace)
+
+
+
+
+### Pull ELR race/ethnicity data from WDRS database - use DRIVE KOPs to fill in race/ethnicity values where it's missing
+
+## Ethnicity
+wdrs_eth_raw <- DBI::dbGetQuery(wdrs, paste0("SELECT DISTINCT CASE_ID,
+                                  WELRS__ID,
+                                  INVESTIGATION_CREATE_DATE,
+                                  WDRS__LAB__ETHNICITY,
+                                  PATIENT__ETHNICITY__PID22__LITERAL
+                                  FROM DD_ELR_DD_PATIENT_ETHNICITY
+                                  WHERE CODE='SARS' AND
+                                  PATIENT__ETHNICITY__PID22__LITERAL NOT IN ('N', 'U') AND
+                                  (WDRS__LAB__ETHNICITY != 'Unknown' OR WDRS__LAB__ETHNICITY IS NULL) AND
+                                  INVESTIGATION_CREATE_DATE >=", "'", filter_dttm, "' AND
+                                  INVESTIGATION_CREATE_DATE <=","'" ,almostMidnightYesterday,"'"))
+
+wdrs_eth_raw$INVESTIGATION_CREATE_DATE <- force_tz(wdrs_eth_raw$INVESTIGATION_CREATE_DATE, tzone= "America/Los_Angeles",roll = TRUE)
+
+#combine wdrs_eth_table and drive_eth_table, replace where WDRS__LAB__ETHNICITY is missing
+wdrs_eth1 <- wdrs_eth_raw
+
+setDT(wdrs_eth1)
+wdrs_eth1[drive_eth_kop, on = .(PATIENT__ETHNICITY__PID22__LITERAL = PID22),
+          WDRS__LAB__ETHNICITY:=ifelse(is.na(WDRS__LAB__ETHNICITY), i.WDRS__LAB__ETHNICITY, WDRS__LAB__ETHNICITY)]
+
+#filter to rows with informative data
+wdrs_eth <- wdrs_eth1 %>%
+  arrange(CASE_ID, WELRS__ID, INVESTIGATION_CREATE_DATE) %>%
+  filter(WDRS__LAB__ETHNICITY %in% c("Hispanic or Latino", "Not Hispanic or Latino",
+                                     "Hispanic, Latino/a, Latinx", "Non-Hispanic, Latino/a, Latinx"))
+
+
+
+
+## Race
+wdrs_race_raw <- DBI::dbGetQuery(wdrs, paste0("SELECT DISTINCT CASE_ID,
+                                  WELRS__ID,
+                                  INVESTIGATION_CREATE_DATE,
+                                  WDRS__LAB__RACE,
+                                  PATIENT__RACE__PID10__LITERAL
+                                  FROM DD_ELR_DD_PATIENT_RACE
+                                  WHERE CODE='SARS' AND
+                                  (WDRS__LAB__RACE != 'Unknown' OR WDRS__LAB__RACE IS NULL) AND
+                                  INVESTIGATION_CREATE_DATE >=", "'", filter_dttm, "' AND
+                                  INVESTIGATION_CREATE_DATE <=","'" ,almostMidnightYesterday,"'"))
+
+wdrs_race_raw$INVESTIGATION_CREATE_DATE <- force_tz(wdrs_race_raw$INVESTIGATION_CREATE_DATE, tzone= "America/Los_Angeles",roll = TRUE)
+
+## Combine wdrs_race_table and drive_race_table, replace where WDRS__LAB__RACE is missing ###
+wdrs_race1 <- wdrs_race_raw
+
+setDT(wdrs_race1)
+wdrs_race1[drive_race_kop, on = .(PATIENT__RACE__PID10__LITERAL = PID10),
+           WDRS__LAB__RACE:=ifelse(is.na(WDRS__LAB__RACE), i.WDRS__LAB__RACE, WDRS__LAB__RACE)]
+
+wdrs_race <- wdrs_race1 %>%
+  arrange(CASE_ID, WELRS__ID, INVESTIGATION_CREATE_DATE) %>%
+  #filter out Unknown since it's useless; keep Other in this main data pull, but filter it out in case enrichment
+  filter(WDRS__LAB__RACE %ni% c("Automated process-unresolved", "ELR data incomplete",
+                                "ELR data not standardized", "Patient declined to respond",
+                                "Race data not reported by lab", "Refused to answer",
+                                "Multiple races imported via roster tool"))
+
+
+## Remove intermediate objects
+rm(wdrs_race1, wdrs_eth1)
+
+## Re-aggregate ethnicity information back to historical labels
+wdrs_eth <- wdrs_eth %>% mutate(WDRS__LAB__ETHNICITY = case_when(
+  WDRS__LAB__ETHNICITY == "Hispanic, Latino/a, Latinx" ~ "Hispanic or Latino",
+  WDRS__LAB__ETHNICITY == "Non-Hispanic, Latino/a, Latinx" ~ "Not Hispanic or Latino",
+  TRUE ~ WDRS__LAB__ETHNICITY
+))
+
+## Re-aggregate lab race information to standard groups
+wdrs_race <- wdrs_race %>% mutate(WDRS__LAB__RACE_original = WDRS__LAB__RACE) %>%
+  mutate(WDRS__LAB__RACE = case_when(
+    WDRS__LAB__RACE == "Alaska Native" ~ "American Indian or Alaska Native",
+    WDRS__LAB__RACE == "American Indian" ~ "American Indian or Alaska Native",
+    WDRS__LAB__RACE == "First Nations" ~ "American Indian or Alaska Native",
+    WDRS__LAB__RACE == "American Indian or Alaska Native" ~ "American Indian or Alaska Native",
+    WDRS__LAB__RACE == "Asian" ~ "Asian",
+    WDRS__LAB__RACE == "Asian Indian" ~ "Asian",
+    WDRS__LAB__RACE == "Bamar/Burman/Burmese" ~ "Asian",
+    WDRS__LAB__RACE == "Bangladeshi" ~ "Asian",
+    WDRS__LAB__RACE == "Bhutanese" ~ "Asian",
+    WDRS__LAB__RACE == "Cham" ~ "Asian",
+    WDRS__LAB__RACE == "Chinese" ~ "Asian",
+    WDRS__LAB__RACE == "Filipino" ~ "Asian",
+    WDRS__LAB__RACE == "Hmong/Mong" ~ "Asian",
+    WDRS__LAB__RACE == "Indonesian" ~ "Asian",
+    WDRS__LAB__RACE == "Japanese" ~ "Asian",
+    WDRS__LAB__RACE == "Karen" ~ "Asian",
+    WDRS__LAB__RACE == "Khmer/Cambodian" ~ "Asian",
+    WDRS__LAB__RACE == "Korean" ~ "Asian",
+    WDRS__LAB__RACE == "Lao" ~ "Asian",
+    WDRS__LAB__RACE == "Malaysian" ~ "Asian",
+    WDRS__LAB__RACE == "Mien" ~ "Asian",
+    WDRS__LAB__RACE == "Nepalese" ~ "Asian",
+    WDRS__LAB__RACE == "Pakistani" ~ "Asian",
+    WDRS__LAB__RACE == "Taiwanese" ~ "Asian",
+    WDRS__LAB__RACE == "Thai" ~ "Asian",
+    WDRS__LAB__RACE == "Vietnamese" ~ "Asian",
+    WDRS__LAB__RACE == "Afro-Caribbean" ~ "Black or African American",
+    WDRS__LAB__RACE == "Black or African American" ~ "Black or African American",
+    WDRS__LAB__RACE == "Congolese" ~ "Black or African American",
+    WDRS__LAB__RACE == "Eritrean" ~ "Black or African American",
+    WDRS__LAB__RACE == "Ethiopian" ~ "Black or African American",
+    WDRS__LAB__RACE == "Kenyan" ~ "Black or African American",
+    WDRS__LAB__RACE == "Oromo" ~ "Black or African American",
+    WDRS__LAB__RACE == "Somali" ~ "Black or African American",
+    WDRS__LAB__RACE == "Ugandan" ~ "Black or African American",
+    WDRS__LAB__RACE == "Fijian" ~ "Native Hawaiian or Other Pacific Islander",
+    WDRS__LAB__RACE == "Guamanian or Chamorro" ~ "Native Hawaiian or Other Pacific Islander",
+    WDRS__LAB__RACE == "Marshallese" ~ "Native Hawaiian or Other Pacific Islander",
+    WDRS__LAB__RACE == "Native Hawaiian" ~ "Native Hawaiian or Other Pacific Islander",
+    WDRS__LAB__RACE == "Native Hawaiian or Other Pacific Islander" ~ "Native Hawaiian or Other Pacific Islander",
+    WDRS__LAB__RACE == "Pacific Islander" ~ "Native Hawaiian or Other Pacific Islander",
+    WDRS__LAB__RACE == "Samoan" ~ "Native Hawaiian or Other Pacific Islander",
+    WDRS__LAB__RACE == "Tongan" ~ "Native Hawaiian or Other Pacific Islander",
+    WDRS__LAB__RACE == "Afghan" ~ "White",
+    WDRS__LAB__RACE == "Arab" ~ "White",
+    WDRS__LAB__RACE == "Egyptian" ~ "White",
+    WDRS__LAB__RACE == "Iranian" ~ "White",
+    WDRS__LAB__RACE == "Iraqi" ~ "White",
+    WDRS__LAB__RACE == "Jordanian" ~ "White",
+    WDRS__LAB__RACE == "Kuwaiti" ~ "White",
+    WDRS__LAB__RACE == "Lebanese" ~ "White",
+    WDRS__LAB__RACE == "Middle Eastern" ~ "White",
+    WDRS__LAB__RACE == "Middle Eastern or North African" ~ "White",
+    WDRS__LAB__RACE == "Moroccan" ~ "White",
+    WDRS__LAB__RACE == "North African" ~ "White",
+    WDRS__LAB__RACE == "Romanian/Rumanian" ~ "White",
+    WDRS__LAB__RACE == "Russian" ~ "White",
+    WDRS__LAB__RACE == "Saudi Arabian" ~ "White",
+    WDRS__LAB__RACE == "Syrian" ~ "White",
+    WDRS__LAB__RACE == "Ukrainian" ~ "White",
+    WDRS__LAB__RACE == "White" ~ "White",
+    WDRS__LAB__RACE == "Yemeni" ~ "White",
+    WDRS__LAB__RACE == "Central American" ~ "Other Race",
+    WDRS__LAB__RACE == "Chicano/a or Chicanx" ~ "Other Race",
+    WDRS__LAB__RACE == "Cuban" ~ "Other Race",
+    WDRS__LAB__RACE == "Dominican" ~ "Other Race",
+    WDRS__LAB__RACE == "Indigenous-Latino/a or Indigenous-Latinx" ~ "Other Race",
+    WDRS__LAB__RACE == "Mestizo" ~ "Other Race",
+    WDRS__LAB__RACE == "Mexican/Mexican American" ~ "Other Race",
+    WDRS__LAB__RACE == "Puerto Rican" ~ "Other Race",
+    WDRS__LAB__RACE == "South African" ~ "Other Race",
+    WDRS__LAB__RACE == "South American" ~ "Other Race",
+    WDRS__LAB__RACE == "Other Race" ~ "Other Race",
+    WDRS__LAB__RACE == "Other race" ~ "Other Race",
+    TRUE ~ WDRS__LAB__RACE
+  ))
+
+##Save wdrs_eth and wdrs_race
+save(wdrs_eth, file = paste0(diqa_path,"filepath.RData"))
+save(wdrs_race, file = paste0(diqa_path,"filepath.RData"))
+
+```
+
+# ECR Race/Ethinicity Pull
+Pull data from WDRS to be used for case race/ethnicity enrichment
+```{r ecr_race_ethnicity_pull }
+
+# Pull race/ethnicity info from WDRS for all cases with eCR info
+
+ecr_wdrs <- dbGetQuery(wdrs, paste0("SELECT
+                                    CASE_ID,
+                                    ECR_RACE,
+                                    ECR_ETHNICITY
+                                    FROM DD_ECR_QUESTION_PACKAGE"))
+
+# Some cases may have multiple associated labs. Use unique function to ensure dataset has only
+# one line per case.
+ecr_wdrs <- unique(ecr_wdrs)
+
+aian <- c("Alaska Native", "American Indian", "First Nations", "American Indian or Alaska Native")
+asian <- c("Asian", "Asian Indian", "Bamar/Burman/Burmese", "Bangladeshi", "Bhutanese", "Cham", "Chinese", "Filipino", "Hmong/Mong", "Indonesian",
+           "Japanese", "Karen", "Khmer/Cambodian", "Korean", "Lao", "Malaysian", "Mien", "Nepalese", "Pakistani", "Taiwanese", "Thai", "Vietnamese")
+black <- c("Afro-Caribbean", "Black", "Black or African American", "Congolese", "Eritrean", "Ethiopian", "Kenyan", "Oromo", "Somali", "Ugandan")
+nhopi <- c("Fijian", "Hawaiian", "Guamanian", "Marshallese", "Native Hawaiian", "Pacific Islander", "Samoan", "Tongan")
+white <- c("Afghan", "Arab", "Egyptian", "Iranian", "Iraqi", "Jordanian", "Kuwaiti", "Lebanese", "Middle Eastern", "Middle Eastern or North African",
+           "Moroccan", "North African", "Romanian/Rumanian", "Russian", "Syrian", "Ukrainian", "White", "Yemeni")
+other_race <- c("Central American", "Chicano/a or Chicanx", "Cuban", "Dominican", "Indigenous-Latino/a or Indigenous-Latinx", "Mestizo",
+                "Mexican/Mexican American", "Puerto Rican", "South African", "South American", "Other Race", "Other race")
+
+```

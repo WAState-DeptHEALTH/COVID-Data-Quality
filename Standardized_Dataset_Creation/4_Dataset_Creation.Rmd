@@ -1,0 +1,1069 @@
+#################################################################################################
+#  COVID CASES DATASET CREATION
+#  COVID-19 R OBJECT DATASET CREATION AND CLEANING PART 4
+################################################################################################
+################################################################################################
+#
+#  This R Markdown script loads in R packages, brings together previously run scripts in this process to join and filter data from various sources, and
+#  enriches and cleans certain data fields such as race/ethnicity in order to ultimately create clean, static COVID-19 datasets in the form of .Rdata files, referred to 
+#  as R Objects. The R Objects are created as an alternative for querying the live (and therefore, more complex and messy) Washington COVID-19 database. 
+#  
+#
+#  **IMPORTANT ACRONYMS/PHRASES USED:**
+#     -WDRS: Washington Disease Reporting System (the primary database for COVID-19 disease reporting information)
+#     -db: database
+#     -df: dataframe; a way to structure data within the base functions of R
+#     -R Object: a set of .RData files with cleaned COVID-19 data to use as a more reliable/static dataset to pull data from compared to the live databse WDRS 
+#     -spectable: a table looking at specimen collection specifically 
+#
+#
+#  This script is helpful to external DOH partners as it demonstrates how to create a standardized dataset for all cases to use as an alternative to querying a live database.
+#  
+################################################################################################
+################################################################################################
+
+
+---
+  title: "covid_cases creation"
+author: "DIQA"
+date: "`r Sys.Date()`"
+output: 
+  html_document:
+  self_contained: no
+chunk_output_type: console
+---
+  
+  ```{r setup4, include=FALSE}
+knitr::opts_chunk$set(echo = TRUE)
+
+
+#Pre-requisites for this script:
+# 1. Packages are loaded and filepaths set up
+# 2. CountyMap exists in DataAssets folder
+# 3. The following objects exist in memory: 
+#   GCD_COVD_19
+#   SpecTable 
+#   wdrs_eth
+#   wdrs_race
+
+#Major parts of this code:
+
+# A. Creation of PosLabs and NegLabsfromTable (previously completed in the AllTests script)
+# B. Select columns from GCD_COVID_19 object, filter to WA residents
+# C. Use SpecTable to evaluate all labs per case and assign earliest positive PCR, antigen, and test dates. Join with case data. 
+# D. Create calculated variables
+#    County
+#    AgeFirstPos
+#    Hospitalization
+#    Duplicates flag
+#    Death
+#    Symptomatic/underlying illness
+#    Summary Race
+# E. Enrich case data with additional race/ethnicity info from labs (wdrs_race and wdrs_eth objects)
+# F. Save covid_cases and covid_cases CSV (with shortened, SAS-friendly names)
+```
+
+# Create PosLabs and NegLabsfromTableJustNeg
+This code is from the discontinued AllTests script.
+```{r test_count_table_prep}
+
+# create labtable, a copy of SpecTable with fewer variables
+LabTable<-SpecTable %>% dplyr::select(
+  CASE_ID,
+  WDRS__RESULT,
+  WDRS__TEST__PERFORMED,
+  WDRS__RESULT__SUMMARY,
+  TEST__METHOD,
+  WDRS__PERFORMING__ORG,
+  INVESTIGATION_CREATE_DATE
+)
+
+# Filter Labtable for tests that are PCR or antigen
+LabTable <-
+  LabTable %>% filter(
+    WDRS__TEST__PERFORMED %in% WDRS__TEST__PERFORMED_positive_filter)
+
+# Filter for positive lab results and make case level dataset.
+PosLabs <-
+  LabTable %>% filter(
+    WDRS__RESULT__SUMMARY == "Positive" &
+      WDRS__RESULT %in% WDRS__RESULT_positive_filter
+  ) %>% dplyr::select(CASE_ID) %>% distinct()
+
+# Create dataframe of everyone who has a negative lab result in WDRS and make case level dataset.
+NegLabsfromTable <-
+  LabTable %>% filter(WDRS__RESULT__SUMMARY != "Positive" &
+                        WDRS__RESULT__SUMMARY != "Test not performed") %>% dplyr::select(CASE_ID) %>% distinct()
+
+# Create dataframe of everyone who has a lab result but no positive lab result by anti-joining with positive lab result table
+NegLabsfromTableJustNeg<- NegLabsfromTable  %>% anti_join(PosLabs)
+
+# Create a dataframe of all case-level test results - negative and positive cases
+allTestResults<- rbind(NegLabsfromTableJustNeg, PosLabs)
+
+# Create and save object for test result counts for Positive cases in GCD_COVID_19 object
+
+PosCaseDetailsGCD <- inner_join(PosLabs, GCD_COVID_19 %>% 
+                                  filter(is.na(REPORTING_STATE) | (REPORTING_STATE == "WA"))) %>% 
+  dplyr::select(CASE_ID, 
+                CREATE_DATE,
+                ACCOUNTABLE_COUNTY,
+                County,
+                EXTERNAL_ID,
+                SEX_AT_BIRTH,
+                FIRST_NAME,
+                LAST_NAME,
+                DOB) %>%
+  mutate(LabTestResult = "Positive")%>%
+  filter(ACCOUNTABLE_COUNTY != "WA-99" ) %>%
+  mutate(ACCOUNTABLE_COUNTY = ifelse(is.na(ACCOUNTABLE_COUNTY), "unknown", ACCOUNTABLE_COUNTY)) 
+
+
+```
+
+
+# Manipulate GCD_COVID_19: create Race_person and Eth_person variable which are enriched from cases belonging to the same person that have available Race or Eth data
+These objects will be used to later to enrich race and ethnicity data. 
+```{r person_level_race_eth_prep}
+
+setDT(GCD_COVID_19)
+
+#generates counts summing each racial category response grouped by EXTERNAL_ID in GCD and makes them unique variables
+count_race <- GCD_COVID_19[, .(n.aian=sum(DASHBOARD_REPORTING_RACE=="American Indian or Alaska Native", na.rm=TRUE),
+                               n.asian=sum(DASHBOARD_REPORTING_RACE=="Asian", na.rm=TRUE),
+                               n.black=sum(DASHBOARD_REPORTING_RACE=="Black", na.rm=TRUE),
+                               n.multi=sum(DASHBOARD_REPORTING_RACE=="Multiracial", na.rm=TRUE),
+                               n.nhopi=sum(DASHBOARD_REPORTING_RACE=="Native Hawaiian or Other Pacific Islander", na.rm=TRUE),
+                               n.other=sum(DASHBOARD_REPORTING_RACE=="Other Race", na.rm=TRUE),
+                               n.unk=sum(DASHBOARD_REPORTING_RACE=="Unknown", na.rm=TRUE),
+                               n.white=sum(DASHBOARD_REPORTING_RACE=="White", na.rm=TRUE), CASE_ID, DASHBOARD_REPORTING_RACE, DASHBOARD_REPORTING_RACE_SOURCE), by=EXTERNAL_ID]
+
+#determine which cases  have mismatched race across external ID; exclude these from enrichment
+mismatch_race <- count_race[(n.aian>0 & (n.asian>0 | n.black>0 | n.multi>0 | n.nhopi>0 | n.other>0 | n.white>0))
+                            | (n.asian>0 & (n.aian>0 | n.black>0 | n.multi>0 | n.nhopi>0 | n.other>0 | n.white>0))
+                            | (n.black>0 & (n.asian>0 | n.aian>0 | n.multi>0 | n.nhopi>0 | n.other>0 | n.white>0))
+                            | (n.multi>0 & (n.asian>0 | n.black>0 | n.aian>0 | n.nhopi>0 | n.other>0 | n.white>0))
+                            | (n.nhopi>0 & (n.asian>0 | n.black>0 | n.multi>0 | n.aian>0 | n.other>0 | n.white>0))
+                            | (n.other>0 & (n.asian>0 | n.black>0 | n.multi>0 | n.nhopi>0 | n.aian>0 | n.white>0))
+                            | (n.white>0 & (n.asian>0 | n.black>0 | n.multi>0 | n.nhopi>0 | n.other>0 | n.aian>0)), ]
+
+# create flag for EXTERNAL_IDs which have at least one case marked as unknown
+unknown_race_flag <- count_race[(n.unk>0 & (n.aian>0 | n.asian>0 | n.black>0 | n.multi>0 | n.nhopi>0 | n.other>0 | n.white>0)),
+                                #exclude any EXTERNAL_IDs which have conflicting race information
+][EXTERNAL_ID %ni% mismatch_race$EXTERNAL_ID
+  #create new variables which will be used for enrichment
+][,`:=`(Race_person = fcase(DASHBOARD_REPORTING_RACE != "Unknown", DASHBOARD_REPORTING_RACE,
+                            default = NA),
+        Race_source_person = fcase(DASHBOARD_REPORTING_RACE_SOURCE != "MISSING", DASHBOARD_REPORTING_RACE_SOURCE,
+                                   default = NA))
+  #remove any persons which are NA and select appropriate columns
+][!is.na(Race_person), .(EXTERNAL_ID, Race_person, Race_source_person)]
+
+# remove cases where race person data is repeated (from different sources)
+unknown_race_flag <- unknown_race_flag[!duplicated(unknown_race_flag[ , c("EXTERNAL_ID", "Race_person")]), ]
+unknown_race_flag <- unknown_race_flag[!duplicated(unknown_race_flag[ , c("EXTERNAL_ID")]), ]
+
+# bind unknown_race_flag with remaining EXTERNAL_IDs
+person_race_flag <- rbindlist(list(unknown_race_flag,
+                                   # exclude EXTERNAL_IDs already found in the mismatch race and unknown_race_flag objects
+                                   count_race[EXTERNAL_ID %ni% mismatch_race$EXTERNAL_ID
+                                   ][EXTERNAL_ID %ni% unknown_race_flag$EXTERNAL_ID
+                                     # create variables which will be used for enrichment
+                                   ][,`:=`(Race_person = fcase(DASHBOARD_REPORTING_RACE != "Unknown", DASHBOARD_REPORTING_RACE,
+                                                               default = NA),
+                                           Race_source_person = fcase(DASHBOARD_REPORTING_RACE_SOURCE != "MISSING", DASHBOARD_REPORTING_RACE_SOURCE,
+                                                                      default = NA))
+                                     # filter out if NA, only want to enrich with filled in race data
+                                   ][!is.na(Race_person), .(EXTERNAL_ID, Race_person, Race_source_person)]),
+                              fill = TRUE)
+
+# remove cases where race person data is repeated from different sources and remove repeated external_IDs
+person_race_flag <- person_race_flag[!duplicated(person_race_flag[ , c("EXTERNAL_ID", "Race_person")]), ]
+person_race_flag <- person_race_flag[!duplicated(person_race_flag[ , c("EXTERNAL_ID")]), ]
+
+
+#generates counts summing each ethnic category response grouped by EXTERNAL_ID in GCD and makes them unique variables
+count_eth <- GCD_COVID_19[, .(n.his=sum(DASHBOARD_REPORTING_ETHNICITY=="Hispanic, Latino/a, Latinx", na.rm=TRUE),
+                              n.not=sum(DASHBOARD_REPORTING_ETHNICITY=="Non-Hispanic, Latino/a, Latinx", na.rm=TRUE),
+                              n.unk=sum(DASHBOARD_REPORTING_ETHNICITY=="Unknown", na.rm=TRUE), CASE_ID, DASHBOARD_REPORTING_ETHNICITY, DASHBOARD_REPORTING_ETHNICITY_SOURCE), by=EXTERNAL_ID]
+
+#determine which cases  have mismatched ethnicity across external ID; exclude these from enrichment
+mismatch_eth <- count_eth[(n.his>0 & n.not>0),]
+
+# create flag for EXTERNAL_IDs which have at least one case marked as unknown; exclude any EXTERNAL_IDs which have conflicting ethnicity information
+unknown_eth_flag <- count_eth[(n.unk>0 & (n.his>0 | n.not>0)),
+][EXTERNAL_ID %ni% mismatch_eth$EXTERNAL_ID
+][,`:=`(Ethnicity_person = fcase(DASHBOARD_REPORTING_ETHNICITY != "Unknown", DASHBOARD_REPORTING_ETHNICITY,
+                                 default = NA),
+        Ethnicity_source_person = fcase(DASHBOARD_REPORTING_ETHNICITY_SOURCE != "MISSING", DASHBOARD_REPORTING_ETHNICITY_SOURCE,
+                                        default = NA))
+][!is.na(Ethnicity_person), .(EXTERNAL_ID, Ethnicity_person, Ethnicity_source_person)]
+
+# remove cases where ethnicity person data is repeated (from different sources)
+unknown_eth_flag <- unknown_eth_flag[!duplicated(unknown_eth_flag[ , c("EXTERNAL_ID", "Ethnicity_person")]), ]
+unknown_eth_flag <- unknown_eth_flag[!duplicated(unknown_eth_flag[ , c("EXTERNAL_ID")]), ]
+
+# bind unknown_eth_flag with remaining EXTERNAL_IDs
+person_eth_flag <- rbindlist(list(unknown_eth_flag,
+                                  # exclude EXTERNAL_IDs already found in the mismatch_eth and unknown_eth_flag objects
+                                  count_eth[EXTERNAL_ID %ni% mismatch_eth$EXTERNAL_ID
+                                  ][EXTERNAL_ID %ni% unknown_eth_flag$EXTERNAL_ID
+                                    # create variables which will be used for enrichment
+                                  ][,`:=`(Ethnicity_person = fcase(DASHBOARD_REPORTING_ETHNICITY != "Unknown", DASHBOARD_REPORTING_ETHNICITY,
+                                                                   default = NA),
+                                          Ethnicity_source_person = fcase(DASHBOARD_REPORTING_ETHNICITY_SOURCE != "MISSING", DASHBOARD_REPORTING_ETHNICITY_SOURCE,
+                                                                          default = NA))
+                                    # filter out if NA, only want to enrich with filled in race data
+                                  ][!is.na(Ethnicity_person), .(EXTERNAL_ID, Ethnicity_person, Ethnicity_source_person)]),
+                             fill = TRUE)
+
+# remove cases where eth person data is repeated from different sources and remove repeated external_IDs
+person_eth_flag <- person_eth_flag[!duplicated(person_eth_flag[ , c("EXTERNAL_ID", "Ethnicity_person")]), ]
+person_eth_flag <- person_eth_flag[!duplicated(person_eth_flag[ , c("EXTERNAL_ID")]), ]
+
+```
+
+# Select Data
+```{r select rows and columns}
+
+### Select relevant columns from the GCD_COVID_19 table ### 
+covid_cases <- GCD_COVID_19[, .(CASE_ID, LAST_NAME, FIRST_NAME, AGE_YEARS, ACCOUNTABLE_COUNTY, 
+                                SEX_AT_BIRTH, DIED_ILLNESS, LIVING_STATUS, DIED_ILLNESS_REPORT, 
+                                HOSPITALIZED_LEAST_OVERNIGHT_ILLNESS, HOSPITALIZED_LEAST_OVERNIGHT_ILLNESS_FACILITY_NAME, 
+                                HOSPITALIZED_LEAST_OVERNIGHT_ILLNESS_FACILITY_NAME_SPECIFY, 
+                                CDC_EVENT_DATE, DOH_CASE_CLASSIFICATION_REPORTING, STATE, 
+                                TEN_DAYS_PATIENT_HEALTHCARE_SETTING_START_DATE_TYPE_FACILITY, 
+                                CDC_EVENT_DATE_SARS, CREATE_DATE, DEATH_DATE, RACE_AGGREGATED, 
+                                RACE_EXTENDED, RACE_AI_OR_AN, RACE_AMERICAN_INDIAN_OR_ALASKA_NATIVE, 
+                                RACE_ASIAN, RACE_BLACK_OR_AFRICAN_AMERICAN, RACE_DECLINED, 
+                                RACE_NATIVE_HAWIAIIAN_OR_OTHER_PACIFIC_ISLANDER, RACE_NH_OR_PI, 
+                                RACE_OTHER_RACE, RACE_OTHER_RACE_SPECIFY, RACE_UNKNOWN, RACE_WHITE, 
+                                ETHNICITY, DOB, IMMUNOSUPPRESSIVE_THERAPY_DISEASE, OCCUPATION, 
+                                OCCUPATION_TYPE, OCCUPATION_EMPLOYER, OCCUPATION_BUSINESS_TYPE, 
+                                WORK_NAME, SYMPTOM_ONSET_DATE, ADDRESS_LINE1, CITY, POSTAL_CODE, 
+                                POSITIVE_PCR_LAB_DATE_COVID19, MIDDLE_NAME, CDC_N_COV_2019_HOSPITALIZED_FACILITY_NAME, 
+                                CDC_N_COV_2019_HOSPITALIZED, CDC_N_COV_2019_HOSPITALIZED_ADMISSION_DATE, 
+                                CDC_N_COV_2019_HOSPITALIZED_DISCHARGE_DATE, CDC_N_COV_2019_HOSPITALIZED_MECHANICAL_VENTILATION_INTUBATION_REQUIRED, 
+                                CDC_N_COV_2019_HOSPITALIZED_ICU, CDC_N_COV_2019_HOSPITALIZED_RHINO_ID_V2, 
+                                CDC_N_COV_2019_HOSPITALIZED_RHINO_DATETIME, CDC_N_COV_2019_HOSPITALIZED_RHINO_HOSPITALIZED, 
+                                CDC_N_COV_2019_HOSPITALIZED_RHINO_FACILITY_NAME, CDC_N_COV_2019_HOSPITALIZED_RHINO_VISIT_DATE, 
+                                CDC_N_COV_2019_HOSPITALIZED_RHINO_NOTE_V2, HOSPITALIZED_LEAST_OVERNIGHT_ILLNESS_FACILITY_NAME_HOSPITAL_ADMISSION_DATE, 
+                                HOSPITALIZED_LEAST_OVERNIGHT_ILLNESS_FACILITY_NAME_HOSPITAL_DISCHARGE_DATE, 
+                                REPORTING_ADDRESS, REPORTING_CITY, REPORTING_STATE, REPORTING_ZIPCODE, 
+                                CDC_N_COV_2019_EDRS_ID, CDC_N_COV_2019_LNI_DATA_AVAILABLE, 
+                                CDC_N_COV_2019_LNI_DATETIME, CDC_N_COV_2019_LNI_OCCUPATION_CODE_SOC2010, 
+                                CDC_N_COV_2019_LNI_OCCUPATION_TITLE, CDC_N_COV_2019_LNI_INDUSTRY_CODE_NAICS2007, 
+                                CDC_N_COV_2019_LNI_INDUSTRY_TITLE, IO_NIOCCS_DATA_AVAILABLE, IO_NOICSS_DATETIME,
+                                IO_CODING_SCHEME, IO_NAICS_TITLE, IO_NAICS_CODE, IO_NAICS_PROB, IO_SOC_TITLE,
+                                IO_SOC_CODE, IO_SOC_PROB, IO_CENSUS_IND_TITLE, IO_CENSUS_IND_CODE, IO_CENSUS_OCC_TITLE, IO_CENSUS_OCC_CODE,
+                                LANGUAGE, CDC_N_COV_2019_DEATH_CERTIFICATE_NUMBER, 
+                                SSN, CASE_COMPLETE_DATE, EVER_RECEIVED_VACCINE_BREAKTHROUGH_CASE, 
+                                CDC_N_COV_2019_SEQUENCE_SPECIMEN, CDC_N_COV_2019_SEQUENCE_VARIANT_OPEN_TEXT, 
+                                CDC_N_COV_2019_SEQUENCE_STATUS, CDC_N_COV_2019_SEQUENCE_SPECIMEN_COLLECTION_DATE, 
+                                POSITIVE_AG_EXISTS_COVID19, POSITIVE_PCR_EXISTS_COVID19, 
+                                POSITIVE_AG_LAB_DATE_COVID19, PREGNANCY_STATUS, 
+                                MODIFICATION_DATE, CDC_N_COV_2019_SEQUENCE_REASON, 
+                                CDC_N_COV_2019_SEQUENCE_SGTF, DEATH_RECENT_INFECTION, STATUS, 
+                                EXTERNAL_ID, CASE_DEDUPLICATION_STATUS, PERSON_DEDUPLICATION_STATUS, 
+                                DOH_ANALYTIC_YEAR, DOH_ANALYTIC_CASE_CLASSIFICATION, 
+                                DOH_ANALYTIC_EVENT_DATE, DOH_ANALYTIC_MMWR_YEAR, VAX_STATUS_AT_POSITIVE_TEST, 
+                                County, ACH, Road.to.recovery.region, EASTERN_WESTERN_WASHINGTON)]
+
+### Filter out non-WA residents and rows where CASE_ID is missing (shouldn't be any)
+covid_cases <- covid_cases[(REPORTING_STATE == "WA" | is.na(REPORTING_STATE)) & (ACCOUNTABLE_COUNTY != "WA-99" | is.na(ACCOUNTABLE_COUNTY))
+][!(is.na(CASE_ID))]
+
+# Convert characters to Latin - first, middle, and last name
+covid_cases[,`:=`(FIRST_NAME=stri_trans_general(FIRST_NAME, id="Latin-ASCII"),
+                  MIDDLE_NAME=stri_trans_general(MIDDLE_NAME, id="Latin-ASCII"),
+                  LAST_NAME=stri_trans_general(LAST_NAME, id="Latin-ASCII"))]
+
+```
+
+# Evaluate labs and assign dates
+```{r evaluate labs and assign dates}
+# Select desired variables
+# filter rows to only positives
+# assign TestType and CaseType variables. Why do we have both? Heaven only knows.
+setDT(SpecTable)
+
+
+SpecTable2 <- SpecTable[, .(CASE_ID, CREATE_DATE, WDRS__RESULT, WDRS__TEST__PERFORMED,
+                            WDRS__RESULT__SUMMARY, INVESTIGATION_CREATE_DATE, SPECIMEN__COLLECTION__DTTM, 
+                            ORDFAC__NAME)
+][!(is.na(INVESTIGATION_CREATE_DATE)) & WDRS__TEST__PERFORMED %in% WDRS__TEST__PERFORMED_positive_filter
+  & WDRS__RESULT__SUMMARY == "Positive" & WDRS__RESULT %in% WDRS__RESULT_positive_filter
+][,`:=`(TestType = fcase(WDRS__RESULT == "SARS-CoV-2 (virus causing COVID-19) detected", "Molecular Positive",
+                         WDRS__RESULT == "SARS-CoV-2 (virus causing COVID-19) antigen detected", "Antigen Positive",
+                         WDRS__RESULT == "Autopsy specimen - SARS-CoV-2 (virus causing COVID-19) antigen detected", "Antigen Positive"))
+][, `:=`(CaseType = fcase(WDRS__RESULT == "SARS-CoV-2 (virus causing COVID-19) detected", "PCR Positive",
+                          WDRS__RESULT == "SARS-CoV-2 (virus causing COVID-19) antigen detected", "Antigen Positive",
+                          WDRS__RESULT == "Autopsy specimen - SARS-CoV-2 (virus causing COVID-19) antigen detected", "Antigen Positive"))]
+
+#Create a third SpecTable object that contains ordering facility info and de-duplicate based on CASE_ID and SCD
+SpecTable3 <- SpecTable2[, .(CASE_ID, SPECIMEN__COLLECTION__DTTM,ORDFAC__NAME)
+][!duplicated(SpecTable2[ , c("CASE_ID", "SPECIMEN__COLLECTION__DTTM")]), ]
+
+setDF(SpecTable)
+## Evaluate earliest SPECIMEN_COLLECTION_DTTM and INVESTIGATION_CREATE_DATE values for each case and each lab type
+
+#antigen dates
+
+antigen_dates <- SpecTable2[TestType  %in% c('Antigen Positive')][, .(SPECIMEN__COLLECTION__DTTM_Antigen = min(SPECIMEN__COLLECTION__DTTM),
+                                                                      INVESTIGATION_CREATE_DATE_Antigen = min(INVESTIGATION_CREATE_DATE),
+                                                                      LAST_POSITIVE_SPECIMEN__COLLECTION__DTTM_Antigen = max(SPECIMEN__COLLECTION__DTTM)),
+                                                                  by = .(CASE_ID)][order(CASE_ID,)]
+
+#PCR dates
+PCR_dates <- SpecTable2[TestType  %in% c('Molecular Positive')][, .(SPECIMEN__COLLECTION__DTTM_PCR = min(SPECIMEN__COLLECTION__DTTM),
+                                                                    INVESTIGATION_CREATE_DATE_PCR = min(INVESTIGATION_CREATE_DATE),
+                                                                    LAST_POSITIVE_SPECIMEN__COLLECTION__DTTM_PCR = max(SPECIMEN__COLLECTION__DTTM)),
+                                                                by = .(CASE_ID)][order(CASE_ID,)]
+
+
+#earliest dates regardless of test type
+earliest_dates <- SpecTable2[, .(LAST_POSITIVE_SPECIMEN__COLLECTION__DTTM = max(SPECIMEN__COLLECTION__DTTM),
+                                 SPECIMEN__COLLECTION__DTTM = min(SPECIMEN__COLLECTION__DTTM),
+                                 INVESTIGATION_CREATE_DATE = min(INVESTIGATION_CREATE_DATE)),by = .(CASE_ID)
+][order(CASE_ID,)]
+
+##Join all the lab dates with the covid_cases dataset
+covid_cases <- antigen_dates[covid_cases, on = .(CASE_ID)]
+covid_cases <- PCR_dates[covid_cases, on = .(CASE_ID)]
+covid_cases <- earliest_dates[covid_cases, on = .(CASE_ID)]
+
+#Remove any individuals where the first positive lab is today
+#Keep only cases where first positive is 2021 or later
+#Populate MMWR year = 2020 for cases on January 1 and 2 2021
+#Populate MMWR year = 2021 for cases on January 1 2022
+
+#MMWR Week 1 for 2023 started on Jan 1 so no change needed
+
+covid_cases <- covid_cases[INVESTIGATION_CREATE_DATE != Sys.Date()
+][SPECIMEN__COLLECTION__DTTM >= filter_date
+][is.na(DOH_ANALYTIC_YEAR) | DOH_ANALYTIC_YEAR >= filter_year | DOH_ANALYTIC_CASE_CLASSIFICATION == "Not a counted case"
+][, `:=`(DOH_ANALYTIC_MMWR_YEAR = fcase(SPECIMEN__COLLECTION__DTTM == "2021-01-01" | SPECIMEN__COLLECTION__DTTM == "2021-01-02", 2020,
+                                        SPECIMEN__COLLECTION__DTTM == "2022-01-01", 2021,
+                                        rep(TRUE, .N), DOH_ANALYTIC_MMWR_YEAR))]
+
+# join submitter and ordering facility data into covid_cases based on CASE_ID and SCD
+covid_cases <- SpecTable3[covid_cases, on = .(CASE_ID, SPECIMEN__COLLECTION__DTTM)]
+rm(SpecTable3)
+```
+
+
+```{r CaseType}
+# Change Case Type
+# Define antigen as antigen positive without PCR positive
+
+covid_cases <- covid_cases[,`:=`(CaseType = fcase(POSITIVE_PCR_EXISTS_COVID19 == "YES", "PCR Positive",
+                                                  POSITIVE_AG_EXISTS_COVID19 == "YES", "Antigen Positive",
+                                                  rep(TRUE, .N), "Negative"))
+][CaseType != "Negative"]
+```
+
+```{r AgeFirstPos}
+
+#create AgeFirstPos variable and use it instead of AGE_YEARS for AgeGroup
+
+covid_cases <- covid_cases[, `:=`(c("AgeFirstPos", "AgeDays"), {
+  AgeFirstPos <- as.numeric(floor(lubridate::time_length(difftime(SPECIMEN__COLLECTION__DTTM, DOB), "years")))
+  AgeDays <- as.numeric(floor(lubridate::time_length(difftime(SPECIMEN__COLLECTION__DTTM, DOB), "days"))) #create AgeDays to make illogical ages "Unknown"
+  .(AgeFirstPos, AgeDays)})
+  #If Age (years) > 115 years or DOB in future, then NA
+][, AgeFirstPos := fifelse((AgeFirstPos > 115 | DOB > SPECIMEN__COLLECTION__DTTM), NA_real_, AgeFirstPos)
+  #If Age (days) <= 1 days and not from a hospital or medical center with labor/delivery, then NA
+][, AgeFirstPos := fifelse( 
+  (AgeDays <= 1 & !str_detect(ORDFAC__NAME, stringr::regex("Hospital|Medical Center|Pediatric|Children|General|Med Center", ignore_case = TRUE))), NA_real_, AgeFirstPos)
+][, AgeFirstPos := fifelse(AgeFirstPos < 1, (lubridate::interval(DOB, SPECIMEN__COLLECTION__DTTM)%/%months(1))/12, AgeFirstPos)
+][, AgeGroup := fcase(AgeFirstPos < 5, "0-4",
+                      AgeFirstPos >= 5 & AgeFirstPos < 18, "5-17",
+                      AgeFirstPos >= 18 & AgeFirstPos < 45, "18-44",
+                      AgeFirstPos >= 45 & AgeFirstPos < 65, "45-64",
+                      AgeFirstPos >= 65 & AgeFirstPos < 80, "65-79",
+                      AgeFirstPos >= 80, "80+",
+                      rep(TRUE, .N), "Unknown")
+][, AgeGroup := factor(AgeGroup, levels = c("0-4", "5-17", "18-44", "45-64", "65-79", "80+", "Unknown"))]
+
+#remove unneeded  variables
+covid_cases <- covid_cases[, c("AGE_YEARS", "ORDFAC__NAME", "AgeDays"):=NULL]
+
+
+```
+
+```{r LTCF and Death}
+
+covid_cases <- covid_cases[, `:=`(
+  Hospital = fifelse(HOSPITALIZED_LEAST_OVERNIGHT_ILLNESS_FACILITY_NAME == "Health Care Facility Not Listed",
+                     HOSPITALIZED_LEAST_OVERNIGHT_ILLNESS_FACILITY_NAME_SPECIFY, HOSPITALIZED_LEAST_OVERNIGHT_ILLNESS_FACILITY_NAME_SPECIFY))]
+
+
+### CovidDeath variable
+covid_cases <- covid_cases[, `:=`(
+  CovidDeath = fifelse((DEATH_RECENT_INFECTION == "Yes" & LIVING_STATUS == 1 & DIED_ILLNESS_REPORT %in% c("Yes", "Suspect")), "Yes", "No"))]
+
+#Don't count deaths if the death certificate number is missing - should there be similar code for C, P, S, and M covid deaths?
+covid_cases <- covid_cases[, `:=`(
+  CovidDeath = fifelse(CovidDeath == "Yes" & is.na(CDC_N_COV_2019_DEATH_CERTIFICATE_NUMBER), NA_character_, CovidDeath))]
+
+
+```
+
+```{r Duplicates}
+#2023/05/10: To be deleted later? 
+# Add duplicates variable
+covid <- covid_cases[, .(FIRST_NAME, LAST_NAME, CASE_ID, DOB, CREATE_DATE, SPECIMEN__COLLECTION__DTTM, INVESTIGATION_CREATE_DATE)
+][order(FIRST_NAME, LAST_NAME, DOB, SPECIMEN__COLLECTION__DTTM, CASE_ID)]
+
+#Generate Dup column which has counts of how many times the same first name, last name, dob, and scd are present in the cc object
+covid <- covid[, `:=` (Dup  = 1:.N), by=.(FIRST_NAME, LAST_NAME, DOB, SPECIMEN__COLLECTION__DTTM)]
+duplicates_name <- covid[Dup==2,!c("CASE_ID","CREATE_DATE","Dup","INVESTIGATION_CREATE_DATE")]
+duplicates_id <- merge.data.table(duplicates_name,covid)
+duplicates_id <- duplicates_id[, `:=`(Duplicates = fifelse(Dup == 1, 0, 1))]
+duplicates_id <- duplicates_id[,Dup:=NULL]
+dup_id <- duplicates_id[, .(CASE_ID,Duplicates)]
+
+
+#add the dup_id into the covid_cases database
+covid_cases <- dup_id[covid_cases, on = .(CASE_ID)]
+covid_cases[, `:=`(Duplicates = fifelse(is.na(Duplicates), 
+                                        0, Duplicates))]
+```
+
+```{r Hospitalization vars}
+# Create a merged hospitalization field based on WDRS and RHINO inputs
+covid_cases <- covid_cases[, `:=`(wdrshosp = paste(CDC_N_COV_2019_HOSPITALIZED, HOSPITALIZED_LEAST_OVERNIGHT_ILLNESS, sep = ","))
+][, `:=`(wdrshosp = toupper(wdrshosp))
+][, `:=`(mhosp = fcase(grepl("YES", wdrshosp), "Yes",
+                       (grepl("^NO", wdrshosp) | grepl("NO$", wdrshosp)), "No"))
+][, `:=`(mhosp = fcase((is.na(mhosp) & grepl("Yes", CDC_N_COV_2019_HOSPITALIZED_RHINO_HOSPITALIZED)), "Yes",
+                       rep(TRUE, .N), mhosp))
+][, `:=`(mhosp = fcoalesce(mhosp, "Unknown"))]
+
+
+#Filter the variables - mhosp included here
+cwdrs <- unique(covid_cases[, .(LAST_NAME, FIRST_NAME, MIDDLE_NAME, DOB, CASE_ID, SPECIMEN__COLLECTION__DTTM,
+                                CDC_EVENT_DATE_SARS, HOSPITALIZED_LEAST_OVERNIGHT_ILLNESS, 
+                                HOSPITALIZED_LEAST_OVERNIGHT_ILLNESS_FACILITY_NAME, HOSPITALIZED_LEAST_OVERNIGHT_ILLNESS_FACILITY_NAME_SPECIFY, 
+                                HOSPITALIZED_LEAST_OVERNIGHT_ILLNESS_FACILITY_NAME_HOSPITAL_ADMISSION_DATE, 
+                                HOSPITALIZED_LEAST_OVERNIGHT_ILLNESS_FACILITY_NAME_HOSPITAL_DISCHARGE_DATE, 
+                                CDC_N_COV_2019_HOSPITALIZED, CDC_N_COV_2019_HOSPITALIZED_FACILITY_NAME, 
+                                CDC_N_COV_2019_HOSPITALIZED_ADMISSION_DATE, CDC_N_COV_2019_HOSPITALIZED_DISCHARGE_DATE, 
+                                CDC_N_COV_2019_HOSPITALIZED_MECHANICAL_VENTILATION_INTUBATION_REQUIRED, 
+                                CDC_N_COV_2019_HOSPITALIZED_ICU, SEX_AT_BIRTH, AgeFirstPos, 
+                                RACE_AMERICAN_INDIAN_OR_ALASKA_NATIVE, RACE_ASIAN, RACE_BLACK_OR_AFRICAN_AMERICAN, 
+                                RACE_NATIVE_HAWIAIIAN_OR_OTHER_PACIFIC_ISLANDER, RACE_WHITE, 
+                                RACE_UNKNOWN, RACE_OTHER_RACE, RACE_OTHER_RACE_SPECIFY, ETHNICITY, 
+                                ACCOUNTABLE_COUNTY, CDC_N_COV_2019_HOSPITALIZED_RHINO_ID_V2, 
+                                CDC_N_COV_2019_HOSPITALIZED_RHINO_DATETIME, CDC_N_COV_2019_HOSPITALIZED_RHINO_HOSPITALIZED, 
+                                CDC_N_COV_2019_HOSPITALIZED_RHINO_FACILITY_NAME, CDC_N_COV_2019_HOSPITALIZED_RHINO_VISIT_DATE, 
+                                CDC_N_COV_2019_HOSPITALIZED_RHINO_NOTE_V2, CREATE_DATE, mhosp, 
+                                wdrshosp)])
+
+##Filter down to only hospitalized cases
+cwdrs_hosp <- cwdrs[mhosp == "Yes"]
+
+## Create first admit date 
+# Create vector with hospital date variables to modify
+vars_hosp_date <-  c("CDC_N_COV_2019_HOSPITALIZED_ADMISSION_DATE"
+                     , "HOSPITALIZED_LEAST_OVERNIGHT_ILLNESS_FACILITY_NAME_HOSPITAL_ADMISSION_DATE"
+                     , "CDC_N_COV_2019_HOSPITALIZED_RHINO_VISIT_DATE")
+
+# ------ TEST THIS FUNCTION ---------
+# create function to modify date variables
+function_hospital_date_format <- function(hosp, date_vars){
+  # Ensure dates as characters - these dates have to be processed as characters due to some issues with converting to date formats 
+  hosp[, (date_vars) := lapply(.SD, as.character), .SDcols = date_vars]
+  #Ensure consistent date formats
+  hosp[, (date_vars) := lapply(.SD, function(x) gsub("-", "/",x)), .SDcols = date_vars]
+  #Remove admit dates prior to 1/12/2020
+  hosp[, (date_vars) := lapply(.SD, function(x) gsub("01/0[1-9]/2020","",x)), .SDcols = date_vars]
+  #Remove whitespace
+  hosp[, (date_vars) := lapply(.SD, trimws), .SDcols = date_vars]
+  #Remove spaces in the date fields
+  hosp[, (date_vars) := lapply(.SD, function(x) gsub("\\s","",x)), .SDcols = date_vars]
+  # remove start or end with comma
+  hosp[, (date_vars) := lapply(.SD, function(x) gsub("^,{1,}|,{1,}$", "",x)), .SDcols = date_vars]
+  # multiple commas in a row
+  hosp[, (date_vars) := lapply(.SD, function(x) gsub(",{2,}", ",",x)), .SDcols = date_vars]
+  return(hosp)
+}
+
+# Use function to modify date variables
+cwdrs_hosp <- function_hospital_date_format(hosp=cwdrs_hosp, date_vars = vars_hosp_date)
+
+### Hospital Admission Date Logic
+
+
+#identify the number of dates in each variable (the number of columns that will be transposed when split)
+r_splits <- max(lengths(strsplit(cwdrs_hosp$CDC_N_COV_2019_HOSPITALIZED_RHINO_VISIT_DATE, ",")))
+ad1_splits <- max(lengths(strsplit(cwdrs_hosp$HOSPITALIZED_LEAST_OVERNIGHT_ILLNESS_FACILITY_NAME_HOSPITAL_ADMISSION_DATE, ",")))
+ad2_splits <- max(lengths(strsplit(cwdrs_hosp$CDC_N_COV_2019_HOSPITALIZED_ADMISSION_DATE, ",")))
+
+
+#make vectors with new column names created
+seq.names <- paste0("rdate",1:r_splits)
+ad.names <- c(paste0("ad1date", 1:ad1_splits),paste0("ad2date", 1:ad2_splits))
+
+
+#now, split the three hospitalization date variables up, and put them in their own columns
+#code splits up the date variables into multiple columns (based on # of commas), then finds the minimum value, keeps that, and drops the new columns
+cwdrs_hosp[, paste0("rdate",1:r_splits) := tstrsplit(CDC_N_COV_2019_HOSPITALIZED_RHINO_VISIT_DATE, ",", fixed=T)
+][, paste0("ad1date", 1:ad1_splits) := tstrsplit(HOSPITALIZED_LEAST_OVERNIGHT_ILLNESS_FACILITY_NAME_HOSPITAL_ADMISSION_DATE, ",", fixed=T)
+][, paste0("ad2date", 1:ad2_splits) := tstrsplit(CDC_N_COV_2019_HOSPITALIZED_ADMISSION_DATE, ",", fixed=T)
+  #set to NA any cells which do not have exactly 10 characters - otherwise, there may be issues parsing dates in the next step
+][, c(seq.names,ad.names) := lapply(.SD, function(x) ifelse(nchar(x) != 10, NA, x)), .SDcols=c(seq.names,ad.names)
+  #convert all date character columns to date - required in order to find absolute difference between them
+][, c(seq.names,ad.names) := lapply(.SD, mdy), .SDcols=c(seq.names,ad.names)]
+
+# for most cases, taking the earliest available hospitalization date is fine
+# for some cases this date is outside of the designated limit (admitdate date cannot be >14 days before >21 days after scd)
+# if the case has  multiple reported hospitalizations, taking the hospitalization date nearest the scd is more appropriate
+# create a new dt which converts all hospitalization dates to long form; remove any na dates and keep only unique dates for each CASE_ID
+cwdrs_hosp_long <- melt(cwdrs_hosp, id.vars = c("CASE_ID", "SPECIMEN__COLLECTION__DTTM"), measure.vars = c(seq.names, ad.names))[!is.na(value)] %>%
+  distinct(CASE_ID, SPECIMEN__COLLECTION__DTTM, value, .keep_all = TRUE) %>%
+  dplyr::rename(admitdate = value)
+
+# create hospital flag when hospital admit date is more than 14 days before or more than 21 days after scd
+cwdrs_hosp_long2<-cwdrs_hosp_long[, `:=`(hosp_flag = fcase(SPECIMEN__COLLECTION__DTTM - admitdate > 14, 1,
+                                                           SPECIMEN__COLLECTION__DTTM - admitdate < -21, 1,
+                                                           default = 0))
+                                  # filter to the minimum available hospitalization date, grouped by CASE_ID
+][ , .SD[which.min(admitdate)], by = CASE_ID]
+
+# create CASE_ID list for cases with hospital flags
+hosp_flag_list <- cwdrs_hosp_long2[hosp_flag == 1, .(CASE_ID)]
+
+# for the CASE_IDs which have a hospitalization date exceeding the acceptable range from above, re-assign hospitalization date based on hospitalization date closest to the scd 
+cwdrs_hosp_long3<-cwdrs_hosp_long[CASE_ID %in% hosp_flag_list$CASE_ID
+][, abs_diff := abs(as.numeric(difftime(SPECIMEN__COLLECTION__DTTM, admitdate, units = "days")))
+][ , .SD[which.min(abs_diff)], by = CASE_ID]
+
+# replace the flagged rhino hospitalization dates with ones closer to scd
+cwdrs_hosp_longf <- rbindlist(list(cwdrs_hosp_long2[hosp_flag == 0], cwdrs_hosp_long3), fill = TRUE)
+
+# merge this date back into cwdrs_hosp dt
+cwdrs_hosp <- cwdrs_hosp_longf[cwdrs_hosp, on = 'CASE_ID'
+][, .(CASE_ID, admitdate, hosp_flag)]
+
+
+#join cwdrs_hosp to covid_cases
+# for cases which still have admit dates that exceed the hospitalization window, change their mhosp status to "No" and set admitdates to NA
+covid_cases <- cwdrs_hosp[covid_cases, on = .(CASE_ID)
+][, `:=` (mhosp = case_when(hosp_flag == 1 & mhosp =="Yes" ~ "No",
+                            TRUE ~ mhosp),
+          admitdate = case_when(hosp_flag == 1 & !is.na(admitdate) ~ NA,
+                                TRUE ~ admitdate))][,hosp_flag:=NULL]
+
+```
+
+
+```{r Symptomatic and Underlying condition}
+# Add symptomatic and underlying condition variables 
+
+symptoms <- GCD_COVID_19[, .(CASE_ID, COMPLAINANT_ILL, ANY_FEVER_SUBJECTIVE_MEASURED, 
+                             ABDOMINAL_PAIN, CHILLS, CORYZA, COUGH, DIARRHEA, DIFFICULTY_BREATHING, 
+                             DYSPNEA, HEADACHE, MYALGIA, NAUSEA, VOMITING, PHARYNGITIS, 
+                             PNEUMONIA, ACUTE_RESPIRATORY_INFECTION_FEVER_COUGH, FATIGUE, 
+                             RENAL_FAILURE, CDC_N_COV_2019_WHEEZING, CDC_N_COV_2019_CHEST_TIGHTNESS, 
+                             OTHER_SYMPTOMS, ACUTE_RESPIRATORY_DISTRESS_SYNDROME, CDC_N_COV_2019_ANOSMIA, 
+                             CDC_N_COV_2019_DYSGEUSIA_AGEUSIA)]
+
+underlying_conditions <- GCD_COVID_19[, .(CASE_ID, ANY_UNDERLYING_MEDICAL_CONDITION, ASTHMA, 
+                                          HIGH_BLOOD_PRESSURE, CURRENT_PRESCRIPTIONS_TREATMENT, CANCER_DIAGNOSIS_TREATMENT_12_MONTHS_PRIOR_ONSET, 
+                                          HEMOGLOBINOPATHY, CHEMOTHERAPY, STEROID_THERAPY, ORGAN_TRANSPLANT, 
+                                          CARDIAC_DISEASE, CHRONIC_HEART_DISEASE, CHRONIC_KIDNEY_DISEASE, 
+                                          CHRONIC_LIVER_DISEASE, CHRONIC_LUNG_DISEASE_EG, DIABETES, 
+                                          IMMUNOSUPPRESSIVE_THERAPY_DISEASE, CURRENT_SMOKER)]
+
+symptoms$SymptomCount <- rowSums(symptoms == 'Yes', na.rm = T)
+
+underlying_conditions$ConditionCount <- rowSums(underlying_conditions == 'Yes', na.rm = T)
+
+symptoms <- symptoms[, `:=`(Symptomatic = fcase(SymptomCount > 0, "Yes",
+                                                COMPLAINANT_ILL == "No" & SymptomCount == 0, "No",
+                                                is.na(COMPLAINANT_ILL) & SymptomCount == 0, "Unknown",
+                                                rep(TRUE, .N), "Unknown"))
+][, .(CASE_ID, Symptomatic)]
+
+underlying_conditions <- underlying_conditions[, `:=`(any_under = fcase(
+  ConditionCount > 0, "1",
+  ANY_UNDERLYING_MEDICAL_CONDITION == "No" & ConditionCount == 0, "0",
+  is.na(ANY_UNDERLYING_MEDICAL_CONDITION) & ConditionCount == 0, NA_character_,
+  rep(TRUE, .N), NA_character_))
+][, .(CASE_ID, any_under)]
+
+covid_cases <- symptoms[covid_cases, on = .(CASE_ID)]
+covid_cases <- underlying_conditions[covid_cases, on = .(CASE_ID)]
+
+rm(symptoms)
+rm(underlying_conditions)
+
+setDF(GCD_COVID_19)
+```
+
+## Race and ethnicity
+```{r Race and ethnicity}
+# Race/ethnicity
+covid_cases <- covid_cases[, `:=`(RACE_AI_OR_AN = fcase(RACE_AI_OR_AN == "Not Applicable", NA_character_,
+                                                        rep(TRUE, .N), RACE_AI_OR_AN))
+][, `:=`(RACE_NH_OR_PI = fcase(RACE_NH_OR_PI == "Not Applicable", NA_character_,
+                               rep(TRUE, .N), RACE_NH_OR_PI))]
+
+covid_cases <- covid_cases[, `:=`(RACE_AMERICAN_INDIAN_OR_ALASKA_NATIVE = fcase(!is.na(RACE_AI_OR_AN), "Y",
+                                                                                rep(TRUE, .N), RACE_AMERICAN_INDIAN_OR_ALASKA_NATIVE))
+][, `:=`(RACE_NATIVE_HAWIAIIAN_OR_OTHER_PACIFIC_ISLANDER = fcase(!is.na(RACE_NH_OR_PI), "Y",
+                                                                 rep(TRUE, .N), RACE_NATIVE_HAWIAIIAN_OR_OTHER_PACIFIC_ISLANDER))]
+
+covid_cases <- covid_cases[, `:=`(RACE_AMERICAN_INDIAN_OR_ALASKA_NATIVE = fcase(str_detect(RACE_AGGREGATED, "American Indian or Alaska Native"), "Y",
+                                                                                rep(TRUE, .N), RACE_AMERICAN_INDIAN_OR_ALASKA_NATIVE))
+][, `:=`(RACE_ASIAN = fcase(str_detect(RACE_AGGREGATED, "Asian"), "Y",
+                            rep(TRUE, .N), RACE_ASIAN))
+][, `:=`(RACE_BLACK_OR_AFRICAN_AMERICAN = fcase(str_detect(RACE_AGGREGATED, "Black or African American"), "Y",
+                                                rep(TRUE, .N), RACE_BLACK_OR_AFRICAN_AMERICAN))
+][, `:=`(RACE_NATIVE_HAWIAIIAN_OR_OTHER_PACIFIC_ISLANDER = fcase(str_detect(RACE_AGGREGATED, "Native Hawaiian or Other Pacific Islander"), "Y",
+                                                                 rep(TRUE, .N), RACE_NATIVE_HAWIAIIAN_OR_OTHER_PACIFIC_ISLANDER))
+][, `:=`(RACE_WHITE = fcase(str_detect(RACE_AGGREGATED, "White"), "Y",
+                            rep(TRUE, .N), RACE_WHITE))
+][, `:=`(RACE_OTHER_RACE = fcase(str_detect(RACE_AGGREGATED, "Other Race"), "Y",
+                                 is.na(RACE_AGGREGATED) & RACE_OTHER_RACE == "Y" & is.na(RACE_AI_OR_AN) & is.na(RACE_NH_OR_PI), "Y",
+                                 rep(TRUE, .N), "N"))]
+
+# Create summary "Race" variable and RACEETH_SOURCE variable
+race_vars <- covid_cases[, .(CASE_ID, RACE_WHITE, RACE_UNKNOWN, RACE_OTHER_RACE,
+                             RACE_NATIVE_HAWIAIIAN_OR_OTHER_PACIFIC_ISLANDER,
+                             RACE_BLACK_OR_AFRICAN_AMERICAN, RACE_ASIAN,
+                             RACE_AMERICAN_INDIAN_OR_ALASKA_NATIVE)]
+
+race_vars$RaceCount <- rowSums(race_vars == 'Y', na.rm = T)
+
+race_vars <- race_vars[, .(CASE_ID, RaceCount)]
+
+covid_cases <- race_vars[covid_cases, on = .(CASE_ID)]
+
+rm(race_vars)
+
+# Create ETH_SOURCE column to determine if ethnicity is filled in or unknown
+
+covid_cases <- covid_cases[, `:=`(ETH_SOURCE = fifelse(is.na(ETHNICITY) | ETHNICITY == "Unknown", "MISSING", "FLATTENED"))]
+
+covid_cases <- covid_cases[, `:=`(
+  Race = fcase(RaceCount > 1 & RACE_UNKNOWN == "N", "Multiracial",
+               RACE_AMERICAN_INDIAN_OR_ALASKA_NATIVE == "Y", "American Indian or Alaska Native", 
+               RACE_ASIAN == "Y", "Asian", 
+               RACE_BLACK_OR_AFRICAN_AMERICAN == "Y", "Black", 
+               RACE_WHITE == "Y", "White", 
+               RACE_NATIVE_HAWIAIIAN_OR_OTHER_PACIFIC_ISLANDER == "Y", "Native Hawaiian or Other Pacific Islander", 
+               RACE_OTHER_RACE == "Y", "Other Race", 
+               RACE_DECLINED == "Y" & ETHNICITY == "Patient declined to respond", "Patient declined to respond",
+               RACE_UNKNOWN == "Y" | RaceCount == 0, "Unknown",
+               rep(TRUE, .N), "ERROR"))]
+
+covid_cases <- covid_cases[, `:=`(RACE_SOURCE = fifelse(Race != "Unknown", "FLATTENED", "MISSING"))]
+
+###### Enrich race/ethnicity with person-level data from FLATTENED #######
+
+# enrich race with person-level data, but only if it comes from the FLATTENED table 
+covid_cases <- person_race_flag[covid_cases, on = .(EXTERNAL_ID)
+][, `:=` (Race = fcase((Race == "Unknown" & Race_source_person == "FLATTENED"), Race_person, 
+                       rep(TRUE, .N), Race),
+          RACE_SOURCE = fcase((RACE_SOURCE == "MISSING" & Race_source_person == "FLATTENED"), Race_source_person, 
+                              rep(TRUE, .N), RACE_SOURCE))]
+
+# enrich ethnicity with person-level data, but only if it comes from the FLATTENED table
+covid_cases <- person_eth_flag[covid_cases, on = .(EXTERNAL_ID)
+][, `:=` (ETHNICITY = fcase((ETHNICITY == "Unknown" & Ethnicity_source_person == "FLATTENED"), Ethnicity_person,
+                            (is.na(ETHNICITY) & Ethnicity_source_person == "FLATTENED"), Ethnicity_person,
+                            rep(TRUE, .N), ETHNICITY),
+          ETH_SOURCE = fcase((ETH_SOURCE == "MISSING" & Ethnicity_source_person == "FLATTENED"), Ethnicity_source_person, 
+                             rep(TRUE, .N), ETH_SOURCE))]
+
+
+###### Enrich race/ethnicity with ECR data  #######
+setDT(ecr_wdrs)
+
+ethnicity_enrichment <- ecr_wdrs[, .(CASE_ID, ECR_ETHNICITY)]
+
+names(ethnicity_enrichment)[names(ethnicity_enrichment) == 'ECR_ETHNICITY'] <- 'ETHNICITY2'
+
+exclude <- c("NULL",  "UNK")
+
+ethnicity_enrichment <- ethnicity_enrichment[!ETHNICITY2 %in% exclude]
+
+ethnicity_enrichment <- ethnicity_enrichment[, `:=`(ETH_SOURCE2 = "ECR")]
+
+#filter out  "Unknowns" for case enrichment
+# Multiracial cases are comma delimited. If a comma is detected set to multiracial
+race_enrichment <- ecr_wdrs[, .(CASE_ID, ECR_RACE)]
+
+race_enrichment$RACE_AMERICAN_INDIAN_OR_ALASKA_NATIVE <- str_detect(race_enrichment$ECR_RACE, paste(aian, collapse = '|'))
+race_enrichment$RACE_ASIAN <- str_detect(race_enrichment$ECR_RACE, paste(asian, collapse = '|'))
+race_enrichment$RACE_BLACK_OR_AFRICAN_AMERICAN <- str_detect(race_enrichment$ECR_RACE, paste(black, collapse = '|'))
+race_enrichment$RACE_NATIVE_HAWIAIIAN_OR_OTHER_PACIFIC_ISLANDER <- str_detect(race_enrichment$ECR_RACE, paste(nhopi, collapse = '|'))
+race_enrichment$RACE_OTHER_RACE <- str_detect(race_enrichment$ECR_RACE, paste(other_race, collapse = '|'))
+race_enrichment$RACE_WHITE <- str_detect(race_enrichment$ECR_RACE, paste(white, collapse = '|'))
+
+# Convert TRUE/FALSE observations to Y if TRUE
+race_enrichment <- race_enrichment[, `:=`(RACE_AMERICAN_INDIAN_OR_ALASKA_NATIVE2 = fcase(RACE_AMERICAN_INDIAN_OR_ALASKA_NATIVE == TRUE, "Y",
+                                                                                         rep(TRUE, .N), "N"))]
+
+race_enrichment <- race_enrichment[, `:=`(RACE_ASIAN2 = fcase(RACE_ASIAN == TRUE, "Y",
+                                                              rep(TRUE, .N), "N"))]
+
+race_enrichment <- race_enrichment[, `:=`(RACE_BLACK_OR_AFRICAN_AMERICAN2 = fcase(RACE_BLACK_OR_AFRICAN_AMERICAN == TRUE, "Y",
+                                                                                  rep(TRUE, .N), "N"))]
+
+race_enrichment <- race_enrichment[, `:=`(RACE_NATIVE_HAWIAIIAN_OR_OTHER_PACIFIC_ISLANDER2 = fcase(RACE_NATIVE_HAWIAIIAN_OR_OTHER_PACIFIC_ISLANDER == TRUE, "Y",
+                                                                                                   rep(TRUE, .N), "N"))]
+
+race_enrichment <- race_enrichment[, `:=`(RACE_WHITE2 = fcase(RACE_WHITE == TRUE, "Y",
+                                                              rep(TRUE, .N), "N"))]
+
+race_enrichment <- race_enrichment[, `:=`(RACE_OTHER_RACE2 = fcase(RACE_OTHER_RACE == TRUE, "Y",
+                                                                   rep(TRUE, .N), "N"))]
+
+race_enrichment <- race_enrichment[!ECR_RACE %in% exclude]
+
+race_enrichment <- race_enrichment[, .(CASE_ID, ECR_RACE, RACE_AMERICAN_INDIAN_OR_ALASKA_NATIVE2, RACE_ASIAN2, RACE_BLACK_OR_AFRICAN_AMERICAN2,
+                                       RACE_NATIVE_HAWIAIIAN_OR_OTHER_PACIFIC_ISLANDER2, RACE_WHITE2, RACE_OTHER_RACE2)]
+
+race_vars2 <- race_enrichment[, .(CASE_ID, RACE_WHITE2, RACE_OTHER_RACE2,
+                                  RACE_NATIVE_HAWIAIIAN_OR_OTHER_PACIFIC_ISLANDER2,
+                                  RACE_BLACK_OR_AFRICAN_AMERICAN2, RACE_ASIAN2,
+                                  RACE_AMERICAN_INDIAN_OR_ALASKA_NATIVE2)]
+
+race_vars2$RaceCount2 <- rowSums(race_vars2 == 'Y', na.rm = T)
+
+race_vars2 <- race_vars2[, .(CASE_ID, RaceCount2)]
+
+race_enrichment <- race_vars2[race_enrichment, on = .(CASE_ID)]
+
+rm(race_vars2)
+
+race_enrichment <- race_enrichment[, `:=`(
+  Race2 = fcase(RaceCount2 > 1, "Multiracial",
+                RACE_AMERICAN_INDIAN_OR_ALASKA_NATIVE2 == "Y", "American Indian or Alaska Native",
+                RACE_ASIAN2 == "Y", "Asian",
+                RACE_BLACK_OR_AFRICAN_AMERICAN2 == "Y", "Black",
+                RACE_WHITE2 == "Y", "White", 
+                RACE_OTHER_RACE2 == "Y", "Other Race",
+                RACE_NATIVE_HAWIAIIAN_OR_OTHER_PACIFIC_ISLANDER2 == "Y", "Native Hawaiian or Other Pacific Islander"),
+  RACE_SOURCE2 = "ECR")
+][!(is.na(Race2))][, .(CASE_ID, Race2, RACE_AMERICAN_INDIAN_OR_ALASKA_NATIVE2, RACE_ASIAN2, RACE_BLACK_OR_AFRICAN_AMERICAN2,
+                       RACE_NATIVE_HAWIAIIAN_OR_OTHER_PACIFIC_ISLANDER2, RACE_WHITE2, RACE_OTHER_RACE2, RACE_SOURCE2, RaceCount2)] 
+
+## Combine enriched race/ethnicity with covid_cases
+covid_cases <- ethnicity_enrichment[covid_cases, on = .(CASE_ID)
+][, `:=`(ETH_SOURCE = fifelse((ETHNICITY == "Unknown" | is.na(ETHNICITY)) & !(is.na(ETHNICITY2)), ETH_SOURCE2, ETH_SOURCE))]
+
+covid_cases <- race_enrichment[covid_cases, on = .(CASE_ID)
+][, `:=`(RACE_SOURCE = fifelse(Race == "Unknown" & !(is.na(Race2)), RACE_SOURCE2, RACE_SOURCE))]
+
+covid_cases <- covid_cases[, `:=`(
+  Race = fifelse(RACE_SOURCE == "ECR" & !(is.na(Race2)), Race2, Race),
+  RaceCount = fifelse(RACE_SOURCE == "ECR", RaceCount2, RaceCount),
+  ETHNICITY = fifelse(ETH_SOURCE == "ECR", ETHNICITY2, ETHNICITY),
+  RACE_AMERICAN_INDIAN_OR_ALASKA_NATIVE = fifelse(RACE_SOURCE == "ECR", RACE_AMERICAN_INDIAN_OR_ALASKA_NATIVE2, RACE_AMERICAN_INDIAN_OR_ALASKA_NATIVE), 
+  RACE_ASIAN = fifelse(RACE_SOURCE == "ECR", RACE_ASIAN2, RACE_ASIAN),
+  RACE_BLACK_OR_AFRICAN_AMERICAN = fifelse(RACE_SOURCE == "ECR", RACE_BLACK_OR_AFRICAN_AMERICAN2, RACE_BLACK_OR_AFRICAN_AMERICAN), 
+  RACE_WHITE = fifelse(RACE_SOURCE == "ECR", RACE_WHITE2, RACE_WHITE),
+  RACE_OTHER_RACE = fifelse(RACE_SOURCE == "ECR", RACE_OTHER_RACE2, RACE_OTHER_RACE),
+  RACE_NATIVE_HAWIAIIAN_OR_OTHER_PACIFIC_ISLANDER = fifelse(RACE_SOURCE == "ECR", RACE_NATIVE_HAWIAIIAN_OR_OTHER_PACIFIC_ISLANDER2, RACE_NATIVE_HAWIAIIAN_OR_OTHER_PACIFIC_ISLANDER))]
+
+covid_cases <- covid_cases[,c("RACE_SOURCE2", "ETH_SOURCE2", "Race2", "ETHNICITY2", "RACE_AMERICAN_INDIAN_OR_ALASKA_NATIVE2", "RACE_ASIAN2", 
+                              "RACE_BLACK_OR_AFRICAN_AMERICAN2", "RACE_WHITE2", "RACE_NATIVE_HAWIAIIAN_OR_OTHER_PACIFIC_ISLANDER2", 
+                              "RACE_OTHER_RACE2", "RaceCount2"):=NULL]
+
+###### Enrich race/ethnicity with person-level data from ECR #######
+
+# enrich R&E with person-level data, but only if it comes from ECR data 
+covid_cases <- covid_cases[, `:=` (Race = fcase((Race == "Unknown" & Race_source_person == "ECR"), Race_person, 
+                                                rep(TRUE, .N), Race),
+                                   RACE_SOURCE = fcase((RACE_SOURCE == "MISSING" & Race_source_person == "ECR"), Race_source_person, 
+                                                       rep(TRUE, .N), RACE_SOURCE))
+][, `:=` (ETHNICITY = fcase((ETHNICITY == "Unknown" & Ethnicity_source_person == "ECR"), Ethnicity_person,
+                            (is.na(ETHNICITY) & Ethnicity_source_person == "ECR"), Ethnicity_person,
+                            rep(TRUE, .N), ETHNICITY),
+          ETH_SOURCE = fcase((ETH_SOURCE == "MISSING" & Ethnicity_source_person == "ECR"), Ethnicity_source_person, 
+                             rep(TRUE, .N), ETH_SOURCE))]
+
+###### Enrich race/ethnicity with ELR data  #######
+
+# uses wdrs_eth and wdrs_race created and saved in the race/ethnicity data pull script
+setDT(wdrs_eth)
+setDT(wdrs_race)
+
+#Pull ethnicity data where there is only one lab and pull data into dataset
+lab_frequency_eth <- wdrs_eth[, .(frequency = .N), by = CASE_ID]
+
+#Where there is only one lab, rename ethnicity variables to match WDRS variables
+one_lab_eth <- setnames(lab_frequency_eth[frequency == 1
+][wdrs_eth, on = .(CASE_ID), nomatch = NULL, allow.cartesian = TRUE
+][, .(CASE_ID, WDRS__LAB__ETHNICITY)], "WDRS__LAB__ETHNICITY", "ETHNICITY2")
+
+#compare WDRS__LAB__ETHNICITY within each CASE_ID, and keep information where labs contain the same ethnicity
+several_labs_eth <- lab_frequency_eth[frequency > 1
+][wdrs_eth, on = .(CASE_ID), nomatch = NULL, allow.cartesian = TRUE
+][, `:=`(same_eth = fifelse(duplicated(WDRS__LAB__ETHNICITY), several_labs_eth2 <- 1, 0)), by = .(CASE_ID)]
+
+several_labs_eth <- setnames(unique(several_labs_eth[several_labs_eth[, .I[same_eth == 1], by = .(CASE_ID)]$V1, 
+                                                     .(CASE_ID)][wdrs_eth, on = .(CASE_ID), nomatch = NULL, allow.cartesian = TRUE], 
+                                    by = "CASE_ID")[, .(CASE_ID, WDRS__LAB__ETHNICITY)], "WDRS__LAB__ETHNICITY", 
+                             "ETHNICITY2")
+
+#Create potential race enrichment table
+ethnicity_enrichment <- rbind(one_lab_eth, several_labs_eth)
+
+ethnicity_enrichment <- ethnicity_enrichment[, `:=`(ETH_SOURCE2 = "ELR")]
+
+#remove intermediate
+rm(several_labs_eth, one_lab_eth, lab_frequency_eth)
+
+##Race
+
+#filter out "Other Race" values for case enrichment
+wdrs_race_case <- wdrs_race[WDRS__LAB__RACE != "Other Race"]
+
+#Count number of labs available for each case with missing race data
+lab_freq_race <- wdrs_race_case[, .(frequency = .N), by = CASE_ID]
+
+one_lab_race <- lab_freq_race[frequency == 1
+][wdrs_race, on = .(CASE_ID), nomatch = NULL, allow.cartesian = TRUE
+][, .(CASE_ID, WDRS__LAB__RACE)]
+
+#Compare WDRS__LAB__RACE within each CASE_ID
+several_labs_race <- lab_freq_race[frequency > 1
+][wdrs_race, on = .(CASE_ID), nomatch = NULL, allow.cartesian = TRUE
+][, `:=`(same_race = fifelse(duplicated(WDRS__LAB__RACE), 1, 0)), by = .(CASE_ID)] 
+
+#Where all labs in the table are the same, pull race data and get distinct rows
+same_lab_race <- unique(several_labs_race[same_race == 1, .(CASE_ID)][wdrs_race, on = .(CASE_ID), 
+                                                                      nomatch = NULL, allow.cartesian = TRUE], by = "CASE_ID")[, 
+                                                                                                                               .(CASE_ID, WDRS__LAB__RACE)]
+
+#Pull race data for single labs, create WDRS variables
+single_race <- rbind(one_lab_race, same_lab_race)[, `:=`(
+  RACE_AMERICAN_INDIAN_OR_ALASKA_NATIVE2 = fifelse(WDRS__LAB__RACE == "American Indian or Alaska Native", "Y", "N"),
+  RACE_ASIAN2 = fifelse(WDRS__LAB__RACE == "Asian", "Y", "N"),
+  RACE_BLACK_OR_AFRICAN_AMERICAN2 = fifelse(WDRS__LAB__RACE == "Black or African American", "Y", "N"),
+  RACE_NATIVE_HAWIAIIAN_OR_OTHER_PACIFIC_ISLANDER2 = fifelse(WDRS__LAB__RACE == "Native Hawaiian or Other Pacific Islander", "Y", "N"),
+  RACE_WHITE2 = fifelse(WDRS__LAB__RACE == "White", "Y", "N"))
+][, .(CASE_ID, RACE_AMERICAN_INDIAN_OR_ALASKA_NATIVE2, RACE_ASIAN2, RACE_BLACK_OR_AFRICAN_AMERICAN2,
+      RACE_NATIVE_HAWIAIIAN_OR_OTHER_PACIFIC_ISLANDER2, RACE_WHITE2)]
+
+#Identify labs where there are different race identifications
+diff_lab_race <- several_labs_race[same_race == 0, .(CASE_ID)
+][wdrs_race, on = .(CASE_ID), nomatch = NULL, allow.cartesian = TRUE
+][, .(CASE_ID, WDRS__LAB__RACE)
+][, `:=`(
+  RACE_AMERICAN_INDIAN_OR_ALASKA_NATIVE2 = fifelse(WDRS__LAB__RACE == "American Indian or Alaska Native", 1, 0),
+  RACE_ASIAN2 = fifelse(WDRS__LAB__RACE == "Asian", 1, 0),
+  RACE_BLACK_OR_AFRICAN_AMERICAN2 = fifelse(WDRS__LAB__RACE == "Black or African American", 1, 0),
+  RACE_NATIVE_HAWIAIIAN_OR_OTHER_PACIFIC_ISLANDER2 = fifelse(WDRS__LAB__RACE == "Native Hawaiian or Other Pacific Islander", 1, 0),
+  RACE_WHITE2 = fifelse(WDRS__LAB__RACE == "White", 1, 0))
+][, .(CASE_ID, RACE_AMERICAN_INDIAN_OR_ALASKA_NATIVE2,RACE_ASIAN2,RACE_BLACK_OR_AFRICAN_AMERICAN2,
+      RACE_NATIVE_HAWIAIIAN_OR_OTHER_PACIFIC_ISLANDER2, RACE_WHITE2)
+][, .(RACE_AMERICAN_INDIAN_OR_ALASKA_NATIVE2 = sum(RACE_AMERICAN_INDIAN_OR_ALASKA_NATIVE2),
+      RACE_ASIAN2 = sum(RACE_ASIAN2),
+      RACE_BLACK_OR_AFRICAN_AMERICAN2 = sum(RACE_BLACK_OR_AFRICAN_AMERICAN2),
+      RACE_NATIVE_HAWIAIIAN_OR_OTHER_PACIFIC_ISLANDER2 = sum(RACE_NATIVE_HAWIAIIAN_OR_OTHER_PACIFIC_ISLANDER2),
+      RACE_WHITE2 = sum(RACE_WHITE2)),keyby = .(CASE_ID)
+][, `:=`(
+  RACE_AMERICAN_INDIAN_OR_ALASKA_NATIVE2 = fifelse(RACE_AMERICAN_INDIAN_OR_ALASKA_NATIVE2 >= 1, "Y", "N"),
+  RACE_ASIAN2 = fifelse(RACE_ASIAN2 >= 1, "Y", "N"),
+  RACE_BLACK_OR_AFRICAN_AMERICAN2 = fifelse(RACE_BLACK_OR_AFRICAN_AMERICAN2 >= 1, "Y", "N"),
+  RACE_NATIVE_HAWIAIIAN_OR_OTHER_PACIFIC_ISLANDER2 = fifelse(RACE_NATIVE_HAWIAIIAN_OR_OTHER_PACIFIC_ISLANDER2 >= 1, "Y", "N"),
+  RACE_WHITE2 = fifelse(RACE_WHITE2 >= 1, "Y", "N"))]
+
+#Combine all race data into one dataframe
+race_enrichment <- rbind(single_race, diff_lab_race) 
+
+race_enrichment <- unique(race_enrichment, by = "CASE_ID")
+
+#Remove intermediate dataframes
+rm(diff_lab_race, 
+   single_race, 
+   same_lab_race, 
+   several_labs_race, 
+   one_lab_race, 
+   lab_freq_race)
+
+
+setDT(ethnicity_enrichment) 
+setDT(race_enrichment) 
+
+race_vars2 <- race_enrichment[, .(CASE_ID, RACE_WHITE2, 
+                                  RACE_NATIVE_HAWIAIIAN_OR_OTHER_PACIFIC_ISLANDER2,
+                                  RACE_BLACK_OR_AFRICAN_AMERICAN2, RACE_ASIAN2,
+                                  RACE_AMERICAN_INDIAN_OR_ALASKA_NATIVE2)]
+
+race_vars2$RaceCount2 <- rowSums(race_vars2 == 'Y', na.rm = T)
+
+race_vars2 <- race_vars2[, .(CASE_ID, RaceCount2)]
+
+race_enrichment <- race_vars2[race_enrichment, on = .(CASE_ID)]
+
+rm(race_vars2)
+
+race_enrichment <- race_enrichment[, `:=`(
+  Race2 = fcase(RaceCount2 > 1, "Multiracial",
+                RACE_AMERICAN_INDIAN_OR_ALASKA_NATIVE2 == "Y", "American Indian or Alaska Native",
+                RACE_ASIAN2 == "Y", "Asian",
+                RACE_BLACK_OR_AFRICAN_AMERICAN2 == "Y", "Black",
+                RACE_WHITE2 == "Y", "White", 
+                RACE_NATIVE_HAWIAIIAN_OR_OTHER_PACIFIC_ISLANDER2 == "Y", "Native Hawaiian or Other Pacific Islander"),
+  RACE_SOURCE2 = "ELR")
+][!(is.na(Race2))] 
+
+## Combine enriched race/ethnicity with covid_cases
+covid_cases <- ethnicity_enrichment[covid_cases, on = .(CASE_ID)
+][, `:=`(ETH_SOURCE = fifelse((ETHNICITY == "Unknown" | is.na(ETHNICITY)) & !(is.na(ETHNICITY2)), ETH_SOURCE2, ETH_SOURCE))]
+
+covid_cases <- race_enrichment[covid_cases, on = .(CASE_ID)
+][, `:=`(RACE_SOURCE = fifelse(Race == "Unknown" & !(is.na(Race2)), RACE_SOURCE2, RACE_SOURCE))]
+
+covid_cases <- covid_cases[, `:=`(
+  Race = fifelse(RACE_SOURCE == "ELR" & !(is.na(Race2)), Race2, Race),
+  ETHNICITY = fifelse(ETH_SOURCE == "ELR", ETHNICITY2, ETHNICITY),
+  RaceCount = fifelse(RACE_SOURCE == "ELR", RaceCount2, RaceCount),
+  RACE_AMERICAN_INDIAN_OR_ALASKA_NATIVE = fifelse(RACE_SOURCE == "ELR", RACE_AMERICAN_INDIAN_OR_ALASKA_NATIVE2, RACE_AMERICAN_INDIAN_OR_ALASKA_NATIVE), 
+  RACE_ASIAN = fifelse(RACE_SOURCE == "ELR", RACE_ASIAN2, RACE_ASIAN),
+  RACE_BLACK_OR_AFRICAN_AMERICAN = fifelse(RACE_SOURCE == "ELR", RACE_BLACK_OR_AFRICAN_AMERICAN2, RACE_BLACK_OR_AFRICAN_AMERICAN), 
+  RACE_WHITE = fifelse(RACE_SOURCE == "ELR", RACE_WHITE2, RACE_WHITE),
+  RACE_NATIVE_HAWIAIIAN_OR_OTHER_PACIFIC_ISLANDER = fifelse(RACE_SOURCE == "ELR", RACE_NATIVE_HAWIAIIAN_OR_OTHER_PACIFIC_ISLANDER2, RACE_NATIVE_HAWIAIIAN_OR_OTHER_PACIFIC_ISLANDER))]
+
+covid_cases <- covid_cases[,c("RACE_SOURCE2", "ETH_SOURCE2", "Race2", "ETHNICITY2", "RACE_AMERICAN_INDIAN_OR_ALASKA_NATIVE2", "RACE_ASIAN2", "RACE_BLACK_OR_AFRICAN_AMERICAN2", "RACE_WHITE2", "RACE_NATIVE_HAWIAIIAN_OR_OTHER_PACIFIC_ISLANDER2", "RaceCount2"):=NULL]
+
+
+###### Enrich race/ethnicity with person-level data from ELR #######
+
+# enrich R&E with person-level data, but only if it comes from ELR data 
+covid_cases <- covid_cases[, `:=` (Race = fcase((Race == "Unknown" & Race_source_person == "ELR"), Race_person, 
+                                                rep(TRUE, .N), Race),
+                                   RACE_SOURCE = fcase((RACE_SOURCE == "MISSING" & Race_source_person == "ELR"), Race_source_person, 
+                                                       rep(TRUE, .N), RACE_SOURCE))
+][, `:=` (ETHNICITY = fcase((ETHNICITY == "Unknown" & Ethnicity_source_person == "ELR"), Ethnicity_person,
+                            (is.na(ETHNICITY) & Ethnicity_source_person == "ELR"), Ethnicity_person,
+                            rep(TRUE, .N), ETHNICITY),
+          ETH_SOURCE = fcase((ETH_SOURCE == "MISSING" & Ethnicity_source_person == "ELR"), Ethnicity_source_person, 
+                             rep(TRUE, .N), ETH_SOURCE))]
+
+
+# Create Race_Eth column and add labels regarding race and ethnicity 
+covid_cases <- covid_cases[, `:=`(
+  Race_Eth = fcase(ETHNICITY == "Hispanic or Latino" | ETHNICITY == "Hispanic, Latino/a, Latinx", "Hispanic",
+                   RaceCount > 1 & RACE_UNKNOWN == "N", "Non-Hispanic or unknown/declined ethnicity Multiracial",
+                   RACE_AMERICAN_INDIAN_OR_ALASKA_NATIVE == "Y", "Non-Hispanic or unknown/declined ethnicity American Indian or Alaska Native", 
+                   RACE_ASIAN == "Y", "Non-Hispanic or unknown/declined ethnicity Asian", 
+                   RACE_BLACK_OR_AFRICAN_AMERICAN == "Y", "Non-Hispanic or unknown/declined ethnicity Black", 
+                   RACE_WHITE == "Y", "Non-Hispanic or unknown/declined ethnicity White", 
+                   RACE_NATIVE_HAWIAIIAN_OR_OTHER_PACIFIC_ISLANDER == "Y", "Non-Hispanic or unknown/declined ethnicity Native Hawaiian or Other Pacific Islander", 
+                   RACE_OTHER_RACE == "Y", "Non-Hispanic or unknown/declined ethnicity Other Race", 
+                   RACE_DECLINED == "Y" & ETHNICITY == "Patient declined to respond", "Patient declined to respond",
+                   RACE_DECLINED == "Y"& ETHNICITY == "Pt Prefers Not to Answer", "Patient declined to respond",
+                   RACE_UNKNOWN == "Y" | RaceCount == 0, "Unknown",
+                   rep(TRUE, .N), "ERROR"))]
+
+# Reduce covid_cases ethnicity categories
+covid_cases <- covid_cases[, `:=`(ETHNICITY = case_when(ETHNICITY == "Hispanic or Latino" ~ "Hispanic, Latino/a, Latinx",
+                                                        ETHNICITY == "Not Hispanic or Latino" ~ "Non-Hispanic, Latino/a, Latinx",
+                                                        ETHNICITY == "Pt Prefers Not to Answer" ~ "Patient declined to respond",
+                                                        is.na(ETHNICITY) ~ "Unknown",
+                                                        TRUE ~ ETHNICITY))
+                           # remove unneeded variables from covid_cases object
+][,c( "Race_person", "Race_source_person", "Ethnicity_person", "Ethnicity_source_person"):=NULL]
+
+# remove person-level enrichment objects
+rm(count_race, count_eth, mismatch_race, mismatch_eth, unknown_race_flag, unknown_eth_flag)
+```
+
+
+
+```{r save_csv covid_cases, error=TRUE}
+
+###Save SAS-friendly CSV version of covid_cases
+
+covid_cases2 <- copy(covid_cases)
+
+covid_cases2 <- covid_cases2[, names(covid_cases2) := lapply(.SD, function(x) gsub(",", ";", x))]
+
+setnames(covid_cases2, old=c("CDC_N_COV_2019_HOSPITALIZED_ADMISSION_DATE","CDC_N_COV_2019_HOSPITALIZED_DISCHARGE_DATE",
+                             "CDC_N_COV_2019_HOSPITALIZED_FACILITY_NAME",
+                             "CDC_N_COV_2019_HOSPITALIZED_MECHANICAL_VENTILATION_INTUBATION_REQUIRED",
+                             "CDC_N_COV_2019_HOSPITALIZED_RHINO_DATETIME", "CDC_N_COV_2019_HOSPITALIZED_RHINO_FACILITY_NAME",
+                             "CDC_N_COV_2019_HOSPITALIZED_RHINO_HOSPITALIZED", "CDC_N_COV_2019_HOSPITALIZED_RHINO_ID_V2",
+                             "CDC_N_COV_2019_HOSPITALIZED_RHINO_NOTE_V2", "CDC_N_COV_2019_HOSPITALIZED_RHINO_VISIT_DATE",
+                             "CDC_N_COV_2019_LNI_DATA_AVAILABLE", "CDC_N_COV_2019_LNI_INDUSTRY_CODE_NAICS2007",
+                             "CDC_N_COV_2019_LNI_INDUSTRY_TITLE", "CDC_N_COV_2019_LNI_OCCUPATION_CODE_SOC2010",
+                             "CDC_N_COV_2019_LNI_OCCUPATION_TITLE", "CDC_N_COV_2019_SEQUENCE_SPECIMEN",
+                             "CDC_N_COV_2019_SEQUENCE_SPECIMEN_COLLECTION_DATE", "CDC_N_COV_2019_SEQUENCE_STATUS",
+                             "CDC_N_COV_2019_SEQUENCE_VARIANT_OPEN_TEXT",
+                             "DOH_CASE_CLASSIFICATION_REPORTING", "EVER_RECEIVED_VACCINE_BREAKTHROUGH_CASE",
+                             "HOSPITALIZED_LEAST_OVERNIGHT_ILLNESS", 
+                             "HOSPITALIZED_LEAST_OVERNIGHT_ILLNESS_FACILITY_NAME", 
+                             "HOSPITALIZED_LEAST_OVERNIGHT_ILLNESS_FACILITY_NAME_HOSPITAL_ADMISSION_DATE", 
+                             "HOSPITALIZED_LEAST_OVERNIGHT_ILLNESS_FACILITY_NAME_HOSPITAL_DISCHARGE_DATE", 
+                             "HOSPITALIZED_LEAST_OVERNIGHT_ILLNESS_FACILITY_NAME_SPECIFY", 
+                             "INVESTIGATION_CREATE_DATE","INVESTIGATION_CREATE_DATE_Antigen","INVESTIGATION_CREATE_DATE_PCR",
+                             "LAST_POSITIVE_SPECIMEN__COLLECTION__DTTM",
+                             "LAST_POSITIVE_SPECIMEN__COLLECTION__DTTM_Antigen", 
+                             "LAST_POSITIVE_SPECIMEN__COLLECTION__DTTM_PCR",  
+                             "RACE_AMERICAN_INDIAN_OR_ALASKA_NATIVE", "RACE_NATIVE_HAWIAIIAN_OR_OTHER_PACIFIC_ISLANDER", 
+                             "SPECIMEN__COLLECTION__DTTM_Antigen",
+                             "TEN_DAYS_PATIENT_HEALTHCARE_SETTING_START_DATE_TYPE_FACILITY", "CDC_N_COV_2019_DEATH_CERTIFICATE_NUMBER"),
+         new=c("HOSPITALIZED_ADMISSION_DATE","HOSPITALIZED_DISCHARGE_DATE",
+               "HOSPITALIZED_FACILITY_NAME","HOSPITALIZED_MECH_VENT_INTUB","HOSPITALIZED_RHINO_DATETIME",
+               "HOSPITALIZED_RHINO_FACILITY_NAME","HOSPITALIZED_RHINO_YNU","HOSPITALIZED_RHINO_ID_V2",
+               "HOSPITALIZED_RHINO_NOTE_V2","HOSPITALIZED_RHINO_VISIT_DATE","LNI_DATA_AVAILABLE","LNI_INDUSTRY_CODE_NAICS2007",
+               "LNI_INDUSTRY_TITLE","LNI_OCCUPATION_CODE_SOC2010","LNI_OCCUPATION_TITLE","SEQUENCE_SPECIMEN",
+               "SEQUENCE_SPECIMEN_COLLECT_DATE","SEQUENCE_STATUS","SEQUENCE_VARIANT_OPEN_TEXT",
+               "DOH_CASE_CLASSIF_REPORTING",
+               "VACCINE_BREAKTHROUGH_CASE","HOSP_OVERNIGHT","HOSP_OVERNIGHT_FACILITY_NAME","HOSP_OVERNIGHT_ADMIT_DATE","HOSP_OVERNIGHT_DISCHARGE_DATE",
+               "HOSP_OVERNIGHT_FACILITY_SPECIFY","INV_CREATE_DATE","INV_CREATE_DATE_AG",
+               "INV_CREATE_DATE_PCR", "LAST_POS_SPEC_COLLECT_DTTM",
+               "LAST_POS_SPEC_COLLECT_DTTM_AG","LAST_POS_SPEC_COLLECT_DTTM_PCR", "RACE_AIAN","RACE_NHOPI",
+               "SPECIMEN__COLLECTION__DTTM_AG", "TEN_DAYS_HLTHCARE_FACILITY_TYPE", "DEATH_CERTIFICATE_NUMBER"))
+
+
+fwrite(covid_cases2,
+       file = paste0(Output_tables_wdrs,"covid_cases.csv"),
+       sep = ",",
+       nThread = numCores)
+
+rm(covid_cases2)
+```
+
+```{r save_R covid_cases}
+#Save covid_cases as R object
+#First convert to data.frame in case users do not use data.table
+setDF(covid_cases) 
+save(covid_cases, file=paste0(Output_tables_wdrs,"covid_cases.RData"))
+
+```
+
+```{r table county}
+
+table_county <- covid_cases %>%
+  group_by(County) %>%
+  dplyr::summarize(CaseCount = dplyr::n()) %>%
+  dplyr::select(County, CaseCount)
+
+save(table_county, file = paste0(diqa_path,"CurrentData/table_county.RData"))
+```
+
+# save a .csv file for CHS
+CHS wants a csv file saved with the full variable names, done below:
+  ```{r chs_copy_save, error=TRUE}
+if (day_check=="Mon" | day_check=="Tue" | day_check=="Wed"){
+  fwrite(covid_cases,
+         file = paste0(Output_tables_wdrs,"covid_cases_chs.csv"),
+         sep = ",",
+         nThread = numCores)
+}
+```
+# remove objects not used
+This will free up memory space
+```{r remove_objects_cc}
+
+rm(wdrs_eth_raw, wdrs_race_case, wdrs_race_raw, NegLabsfromTableJustNeg, PCR_dates, SpecTable2, cwdrs, cwdrs_hosp, covid, earliest_dates, antigen_dates, race_enrichment, ethnicity_enrichment, NegLabsfromTable, PosLabs, case_n, covid_csv, case_summary)
+```

@@ -1,0 +1,403 @@
+#################################################################################################
+# "MISE_EN_PLACE", EVERYTHING IN ITS PLACE
+#  PREPARATIONS FOR COVID-19 R OBJECT DATASET CREATION PART 1
+################################################################################################
+################################################################################################
+#
+#  This R Markdown script loads in R packages, sets up directories for eventual outputs, and specifies dates/times used, and filters queries 
+#  for later scripts that are run subsequently in order to ultimately create clean, static COVID-19 datasets in the form of .Rdata files, referred to 
+#  as R Objects. The R Objects are created as an alternative for querying the live (and therefore, more complex and messy) Washington COVID-19 database. 
+#  
+#
+#  **IMPORTANT ACRONYMS/PHRASES USED:**
+#     -WDRS: Washington Disease Reporting System (the primary database for COVID-19 disease reporting information)
+#     -db: database
+#     -df: dataframe; a way to structure data within the base functions of R
+#     -R Object: a set of .RData files with cleaned COVID-19 data to use as a more reliable/static dataset to pull data from compared to the live databse WDRS 
+#     -spectable: a table looking at specimen collection specifically 
+#
+#
+#  This script is helpful to external DOH partners as it demonstrates how to create a standardized dataset for all cases to use as an alternative to querying a live database.
+#  
+################################################################################################
+################################################################################################
+
+
+
+---
+  title: "Package loads, object creation, utility functions"
+author: "Dianna Hergott, Tessa Fairfortune, Seth Rothbard"
+date: "`r Sys.Date()`"
+output: 
+  html_document:
+  self_contained: no
+---
+  
+  ```{r setup1, include=FALSE, results='hide'}
+knitr::opts_chunk$set(echo = FALSE)
+
+```
+
+# Load packages
+
+#The chunk of code below loads all packages necssary to run the scripts in their entirety. Packages should only be loaded here. Individual scripts have load functions, but they are not evaluated/run unless a manual run or QA is being performed. 
+
+#Packages are loaded using the [pacman package](https://www.rdocumentation.org/packages/pacman/versions/0.5.1). It will both install and load packages. 
+#Please note that while tidyverse *installs* several pacakges, it only *loads* a core few: *ggplot2*, *dplyr*, *tidyr*, *readr*, *purr*, *tibble*, *stringr*, and *forcats*. If you need other [packages within tidyverse](https://www.tidyverse.org/packages/), they need to be loaded separately. 
+
+```{r package_load}
+if(!require("pacman")) install.packages("pacman")
+
+pacman::p_load(tidyverse,
+               lubridate,
+               data.table,
+               odbc, 
+               DBI,
+               haven,
+               stringi,
+               parallel,
+               janitor, readxl, here, fs, taskscheduleR, kableExtra,
+               blastula, fs, gt, viridis, curl, 
+               rmdformats, textclean, keyring, gridExtra,
+               tictoc, httr, XML, rjson, raster,
+               sp, rio, formattable, sjmisc, htmltools,
+               sf, future, furrr, plyr, sendmailR, rgdal)
+
+```
+
+# memory boost
+```{r}
+gc()
+
+```
+# Set working drives
+#This section sets up the working drives for calling in and pushing out R objects. All saving, loading, etc. should reference the working drives below. If a new folder is created for an output, please add it here and reference in your code vs. directly putting file pathways in sections of code. 
+```{r set working drives, eval=run_production}
+
+# Git directory
+GITDIR <- "//filepath/"
+
+#repeat Git directory to allow for items to be pulled from the test environment when switched
+FILEDIR <- "//filepath/" 
+
+# Location to output covid deaths
+Death_DIR <- "//filepath/"
+
+# Location of where data object will be output
+Output_tables_wdrs <-"//filepath/"
+
+Output_tables_wdrs_excel <- "//filepath/"
+
+# CDE directory for output
+BASEDIR<- "//filepath/"
+
+# Regional data
+cross_repo_path <- "//filepath/"
+
+# DIQA only base paths - this path will be used to store raw objects (GCD, SpecTable); downstream users will not access these
+diqa_path <- "//filepath/"
+
+# path to run geocoded_covid_cases script
+geocc_path <- "//filepath/"
+
+```
+
+## Test working drives
+#If you are running a TEST of the data, you can use the working drives below. In the 'r {set working drives}` code chunk above, change to eval=FALSE, then change eval=TRUE in the code chunk below. 
+```{r test working drives, eval=run_test}
+
+# Git directory
+
+
+GITDIR <- "//filepath/"
+
+
+
+#this changes in test environment to allow excel sheets, etc to be pulled. Same as BASEDIR in test environment
+FILEDIR <- "//filepath/"
+
+# Location to output covid deaths
+Death_DIR <- "//filepath/"
+
+# Location of where data object will be output
+Output_tables_wdrs <- "//filepath/"
+
+Output_tables_wdrs_excel <- "//filepath/"
+
+#test location for output
+BASEDIR<- "//filepath/"
+
+# Regional data
+cross_repo_path <- "//filepath/"
+
+# DIQA base only path - this path will be used to store raw objects (GCD, SpecTable); downstream users will not access these
+diqa_path <- "//filepath/"
+
+# path to run geocoded_covid_cases script
+geocc_path <- "//filepath/"
+
+```
+
+```{r log time of start }
+
+Start_update_WDRS <-Sys.time()
+Start_update_WDRS<-data.frame(Start_update_WDRS)
+
+```
+
+# Set objects and dates
+
+#There are several objects and dates that are used throughout the scripts. They are just created once, with the code chunk below, and then called into scripts after this. 
+#Therefore, if they need to be updated, they can just be updated within this script. The one "object" that is not set here is the connection to the wdrs, which exists in the *wdrs_pull_and_raw_obejct_save.Rmd* file. 
+
+```{r set_objects}
+
+#"start date"
+pandemic_start_date <- '2020-01-01'
+
+#Filter dates - to filter data to current timeframes 
+filter_date <- '2023-01-01'
+filter_year <- 2023
+filter_dttm <- '2023-01-01 00:00:00'
+
+#scripts will always include data up to "almostMidnightYesterday"
+almostMidnightToday <- as.POSIXlt(paste0(Sys.Date(), " 23:59:59", tz=Sys.timezone()))
+almostMidnightYesterday <- almostMidnightToday - 60*60*24
+
+
+#vector of state holidays - days when scripts will NOT be run, so the lookback date needs to go to the earliest available date before each holiday
+#WA state holidays are: New Years Day, MLK Day, Presidents' Day, Memorial Day, Juneteenth (as of 2022), 
+#Independence Day, Labor Day, Veterans Day, Thanksgiving Day, Indigenous People's Day, Christmas Day. (Columbus Day is NOT a state holiday)
+
+holidays <- as.Date(
+  c("2020-09-07", "2020-11-11", "2020-11-26", "2020-11-27", "2020-12-25", 
+    "2021-01-01", "2021-01-18", "2021-02-15", "2021-05-31", "2021-07-05", "2021-09-06", "2021-11-11", "2021-11-26", "2021-11-27", "2021-12-24", 
+    "2021-12-31", "2022-01-17", "2022-02-21", "2022-05-30", "2022-06-20", "2022-07-04", "2022-09-05", "2022-11-11", "2022-11-24", "2022-11-25", "2022-12-26", "2023-01-02", "2023-01-16", "2023-02-20", "2023-05-29", "2023-06-19", "2023-07-04", "2023-09-04", "2023-11-10", "2023-11-23", "2023-11-24", "2023-12-25" ),  format = "%Y-%m-%d")
+
+date <- lubridate::wday(ymd_hms(Sys.time()), label = TRUE)
+currentDate <- gsub(":", ".", Sys.time(), fixed = TRUE)
+
+```
+
+# Functions
+
+## Date look-back
+#The code below is used in the QA_checks to determine which file to pull for the comparison. The function is called *getlastdate*.
+
+```{r lookback date}
+##### See if the two-day lookback day falls on a holiday ####
+
+x_friday_holiday <-
+  Sys.Date() - 3 == holidays # To run on Tuesday - Looks back to compare Monday's data to Friday's data
+x_monday_holiday <- Sys.Date() - 1 == holidays # To run on Wednesday
+x_tuesday_holiday <- Sys.Date() - 1 == holidays # To run on Thursday
+x_Wednesday_holiday <- Sys.Date() - 1 == holidays # To run on Friday
+x_Thursday_holiday <- Sys.Date() - 1 == holidays
+
+##### If statements to look at the prior comparison day if the 2-day lookback date falls on a holiday ####
+
+x_friday <-
+  ifelse((any(x_friday_holiday == TRUE) & any(x_Thursday_holiday == TRUE)), "Wednesday", ifelse(any(x_friday_holiday == TRUE), "Thursday", "Friday")) 
+# If Friday AND Thursday are holidays use Wednesday's data to compare - only for Thanksgiving, else if Friday is a holiday use Thursday's data - to run on Tuesday
+
+x_monday <-
+  ifelse(any(x_monday_holiday == TRUE), "Friday", "Monday") # If Monday is a holiday use Friday's data to compare - to run on Wednesay
+x_tuesday <-
+  ifelse(any(x_tuesday_holiday == TRUE), "Monday", "Tuesday") # If Tuesday is a holiday use Monday's data to compare - to run on Thursday
+x_wednesday <-
+  ifelse(any(x_Wednesday_holiday == TRUE), "Tuesday", "Wednesday") # IF Wednesday is a holiday use Tuesday to compare - to run on Friday
+
+x_thursday <-
+  ifelse(any(x_Thursday_holiday == TRUE), "Wednesday", "Thursday") # IF Wednesday is a holiday use Tuesday to compare - to run on Friday
+
+##### Determine the two-day look back date name ####
+x <- ifelse(
+  weekdays(Sys.Date()) == "Monday",
+  x_friday,
+  ifelse(
+    weekdays(Sys.Date()) == "Tuesday",
+    x_monday,
+    ifelse(
+      weekdays(Sys.Date()) == "Wednesday",
+      x_tuesday,
+      ifelse(
+        weekdays(Sys.Date()) == "Thursday",
+        x_wednesday,
+        ifelse(weekdays(Sys.Date()) == "Friday", x_thursday, "Friday")
+      )
+    )
+  )
+)
+
+##### Function to select the 2-day lookback date by day name ####
+getlastdate <- function(day) {
+  dates <- seq((Sys.Date() - 7), (Sys.Date() - 1), by = "days")
+  names(dates) <- format(dates, "%A")
+  
+  dates <- dates[x]
+}
+
+##### Select lookback date ####
+
+lookback_date <- getlastdate(x)
+
+```
+
+## Load RData
+The function below allows a user to load in an R object and rename it during the load using *newobjectname* <- loadRData(*savedobjectname.Rdta*)
+```{r loadRData}
+loadRData <- function(fileName){
+  load(fileName)
+  get(ls()[ls() != "fileName"])
+}
+```
+
+## Utility Functions
+### tablen
+Utility function enhancement of table which always returns NA count if there are any, but not otherwise
+```{r tablen}
+
+tablen<- function(...) 
+{
+  args <- unlist(list(...))
+  if (any(is.na(args))) table(exclude = NULL, ...)
+  else table( ...)
+}
+```
+
+### tablec
+utility function enhancement of table which returns a value for each number across range of integers
+**NOTE** - does not test if input consists of integers, will if non-integer values are included
+* minx and maxx specify the range of integers to count, if omitted then the range is min:max
+* if ... is a data.frame, minx and maxx should be of length (ncol(...) and have same names)
+* if ... consists of one or more vectors, the same minx and maxx are used for all vectors
+```{r tablec}
+tablec<- function(..., minx = NULL, maxx = NULL,  useNA = c("no", "ifany", "always"), exclude = if (useNA[1] == "no") c(NA, NaN)) 
+{
+  
+  n2ordered<- function(x, minx = NULL, maxx = NULL)
+  {
+    if (is.null(minx)) minx<- min(x, na.rm = TRUE)
+    if (is.null(maxx)) maxx<- max(x, na.rm = TRUE)
+    setx<- minx:maxx
+    ordered(x, levels = setx)
+  }
+  unord<- function(x)
+    as.numeric(levels(x)[match(x, levels(x))])
+  
+  args <- list(...)
+  # browser()
+  if (length(args) == 1)
+  {
+    if (class(args[[1]]) == 'data.frame')
+    {
+      y<- args[[1]]
+      for (i in names(y))
+        y[,i]<- n2ordered(y[,i], minx = (if(is.null(minx))  minx else minx[i]), maxx =  (if(is.null(maxx))  maxx else maxx[i]))
+      table(y, useNA = useNA, exclude = exclude) 
+    }
+    else 
+    {
+      y<- n2ordered(args[[1]], minx = minx  , maxx = maxx ) 
+      table(y, useNA = useNA, exclude = exclude) 
+    }
+  }
+  else 
+  { 
+    y<- args
+    for (i in 1:length(y))
+      y[[i]]<- n2ordered(y[[i]], minx = minx, maxx =   maxx)
+    
+    table(y, useNA = useNA, exclude = exclude) 
+  }
+}
+```
+
+### grepb
+The function below looks for all values of y that have the pattern of x in them. 
+* x = the word/data string you want (place in quotations)
+* y = the datframe you are searching in
+```{r grepb}
+grepb<- function(x,y) y[grep(tolower(x), tolower(y))]
+```
+
+### not updated
+notUpdated checks a file name to see if it exists and if it has been created during the current half of the data
+If it does exist and was created in the current half of the day returns FALSE, otherwise returns TRUE
+**NOTE** This code does not seem to currently be used anywhere
+```{r}
+notUpdated<- function(ff)
+{
+  AMPM<- ifelse(as.POSIXlt(Sys.time())$hour < 12, "AM", "PM")
+  notUpdatd<- TRUE
+  if (file.exists(ff))
+  {
+    fileTime<- file.mtime(ff)
+    fileTimeAMPM<- ifelse(as.POSIXlt(fileTime)$hour < 12, "AM", "PM")
+    if (  (as.Date(fileTime) == Sys.Date() ) & (fileTimeAMPM == AMPM))
+      notUpdatd<- FALSE
+  }
+  notUpdatd
+}
+```
+
+### define number of cores
+used in covid_cases to speed up csv output
+```{r}
+numCores <- parallel::detectCores() - 1
+
+```
+
+### Helpful negate function
+create the opposite of '%in%'
+```{r}
+'%ni%' <- Negate('%in%')
+```
+
+### Useful Field Filters
+establish commonly repeated filters so if fields/filters change users only have to change the filters at one location
+```{r}
+WDRS__TEST__PERFORMED_positive_filter <- c("PCR/Nucleic Acid Test (NAT, NAAT, DNA)", 
+                                           "RT-PCR",
+                                           "SARS CoV-2 positive by sequencing only",
+                                           "Antigen by Immunoassay (respiratory specimen)", 
+                                           "Fluorescent immunoassay (FIA)",
+                                           "Antigen by Immunocytochemistry (autopsy specimen)")
+
+WDRS__TEST__PERFORMED_negative_filter <- c(
+  "PCR/Nucleic Acid Test (NAT, NAAT, DNA)",
+  "RT-PCR",
+  "G_FIA",
+  "G_RESP_ANTIGEN_IA",
+  "G_EIA",
+  "G_AUTO_ANTIGEN_IC",
+  "Antigen by Immunoassay (respiratory specimen)",
+  "Fluorescent immunoassay (FIA)",
+  "Antigen by Immunocytochemistry (autopsy specimen)"
+)
+
+WDRS__TEST__PERFORMED_negative_antigen_filter <- c(
+  "Antigen by Immunoassay (respiratory specimen)",
+  "Antigen by Immunocytochemistry (autopsy specimen)",
+  "Fluorescent immunoassay (FIA)",
+  "G_FIA",
+  "G_RESP_ANTIGEN_IA",
+  "G_EIA",
+  "G_AUTO_ANTIGEN_IC"
+)
+WDRS__TEST__PERFORMED_molecular_filter <- c("PCR/Nucleic Acid Test (NAT, NAAT, DNA)", "RT-PCR", "SARS CoV-2 positive by sequencing only")
+
+WDRS__RESULT_positive_filter <- c(
+  "SARS-CoV-2 (virus causing COVID-19) detected",
+  "SARS-CoV-2 (virus causing COVID-19) antigen detected",
+  "Autopsy specimen - SARS-CoV-2 (virus causing COVID-19) antigen detected"
+)
+
+WDRS__RESULT_positive_antigen_filter <- c(
+  "SARS-CoV-2 (virus causing COVID-19) antigen detected",
+  "Autopsy specimen - SARS-CoV-2 (virus causing COVID-19) antigen detected"
+)
+
+cste_filter_date <- '2023-01-01'
+
+```

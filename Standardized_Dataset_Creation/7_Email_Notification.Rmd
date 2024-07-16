@@ -1,0 +1,354 @@
+#################################################################################################
+#  AUTOMATIC EMAIL NOTIFICATION FOR COVID CASES DATASET CREATION
+#  COVID-19 R OBJECT DATASET CREATION AND CLEANING PART 7
+################################################################################################
+################################################################################################
+#
+#  This R Markdown script formats and creates an automatic email notification to be sent to R object users to alert them that the clean, static COVID-19 datasets
+#  in the form of .Rdata files, referred to as R Objects, have been created and are ready for use.
+#  The R Objects are created as an alternative for querying the live (and therefore, more complex and messy) Washington COVID-19 database. 
+#  
+#
+#  **IMPORTANT ACRONYMS/PHRASES USED:**
+#     -WDRS: Washington Disease Reporting System (the primary database for COVID-19 disease reporting information)
+#     -db: database
+#     -df: dataframe; a way to structure data within the base functions of R
+#     -R Object: a set of .RData files with cleaned COVID-19 data to use as a more reliable/static dataset to pull data from compared to the live databse WDRS 
+#     -spectable: a table looking at specimen collection specifically
+#
+#
+#  This script is helpful to external DOH partners as it demonstrates how to create a standardized dataset for all cases to use as an alternative to querying a live database.
+#  
+################################################################################################
+################################################################################################
+
+---
+  title: "surveillance object email notification"
+date: "`r Sys.Date()`"
+params: 
+  test_mode: FALSE
+output: 
+  html_document:
+  mathjax: null
+self_contained: no
+code_folding: hide
+---
+  
+  ```{css,echo=FALSE}
+# .myCode {
+# background-color: black;
+# }
+# .Rchunk {
+#   height: 100%;
+#   overflow: auto;
+#   background-color: black;
+# }
+# 
+# .Rout {
+#   height: 100%;
+#   overflow: auto;
+#   background-color: lightblue !important;
+#   font-weight: bolder;
+# }
+```
+
+```{r setup7, include=FALSE}
+knitr::opts_chunk$set(echo = TRUE)
+source_rmd <- function(file, local = FALSE, ...){
+  options(knitr.duplicate.label = 'allow')
+  tempR <- tempfile(tmpdir = ".", fileext = ".R")
+  on.exit(unlink(tempR))
+  knitr::purl(file, output=tempR, quiet = TRUE)
+  envir <- globalenv()
+  source(tempR, local = envir, ...)
+}
+```
+
+```{r first_time_run, eval=FALSE}
+# This only needs to be run once to set up the email
+create_smtp_creds_key(
+  id = "relay",
+  user = "your DOH email",
+  provider = "office365",
+  use_ssl = TRUE,
+  overwrite = TRUE,
+  host = "relay",
+  port = port
+)
+```
+
+## This source script creates the automated email sent to data users following the morning refresh of the COVID-19 Surveillance objects
+
+# Format tables for email
+Data tables cannot be natively inserted into emails. Instead they need to be converted to raw html
+```{r email_tables}
+# Prep Output Table
+output_table_final <- gt(output_table) %>%
+  #All column headers are capitalised
+  opt_all_caps() %>% 
+  #Use the Chivo font
+  #Note the great 'google_font' function in 'gt' that removes the need to pre-load fonts
+  opt_table_font(
+    font = list(
+      google_font("Chivo"),
+      default_fonts()
+    )
+  ) %>%
+  tab_options(
+    #Remove border between column headers and title
+    column_labels.border.top.width = px(3),
+    column_labels.border.top.color = "black",
+    #Remove border around table
+    table.border.top.color = "black",
+    table.border.bottom.color = "black",
+    #Reduce the height of rows
+    data_row.padding = px(3),
+    #Adjust font sizes and alignment
+    source_notes.font.size = 12,
+    heading.align = "left",
+    table.align = "center"
+  ) %>%
+  fmt(
+    columns = everything(),
+    fns = function(x) ifelse(x == 0, "-", x)
+  )
+
+# Prep the Submitter Table
+submitter_table_final <- gt(submitter_table) %>%
+  #All column headers are capitalised
+  opt_all_caps() %>% 
+  #Use the Chivo font
+  #Note the great 'google_font' function in 'gt' that removes the need to pre-load fonts
+  opt_table_font(
+    font = list(
+      google_font("Chivo"),
+      default_fonts()
+    )
+  ) %>%
+  tab_options(
+    #Remove border between column headers and title
+    column_labels.border.top.width = px(3),
+    column_labels.border.top.color = "black",
+    #Remove border around table
+    table.border.top.color = "black",
+    table.border.bottom.color = "black",
+    #Reduce the height of rows
+    data_row.padding = px(3),
+    #Adjust font sizes and alignment
+    source_notes.font.size = 12,
+    heading.align = "left",
+    table.align = "center"
+  ) %>%
+  fmt(
+    columns = everything(),
+    fns = function(x) ifelse(x == 0, "-", x)
+  )
+
+# import the plots - formats get destroyed in outlook, but it's good enough. If you open the outlook email into a web browser the formatting will work.
+output_table_email <- as_raw_html(output_table_final)
+
+submitter_table_email <- as_raw_html(submitter_table_final)
+
+#check if gcc qa was run; if not, put in error message:
+if (!exists("gcc_QA_message")) {
+  gcc_QA_message <- paste0("The geocoded_covid_cases script has not been successfully run today. Please check the log: filepath/Geocoding/QA_Logs/ ")} 
+
+#check if runtime object is available (this may be unavailable if script failed before all times could be calculated and a manual QA run was needed); if not, put in error message:
+if (!exists("runtime")) {
+  runtime <- paste0("Script run time is unavailable as QA had to be run manually.")} 
+
+```
+
+These links will be embedded in the body of the email.
+```{r hyperlink_creation, eval=TRUE}
+
+#1-pager link
+one_pager <- '<link>'
+
+
+one_pager_text <- paste0("For more information on R object usage, please see our ", one_pager)
+
+#covid_cases data dictionary link
+cc_dd <- '<link>'
+
+
+cc_dd_text <- paste0("A data dictionary for the covid_cases object can be found ", cc_dd)
+
+```
+
+
+# Create the Auto Email for production. Otherwise send error email
+```{r auto_email_composition_production, eval=TRUE}
+
+#conditional for sending the email
+if (file.exists(paste0(Output_tables_wdrs, "covid_cases.RData"))) {
+  
+  
+  #from
+  f <- sprintf("<your.email@email.com>")
+  
+  
+  #conditional based on whether production or test run for emailing list
+  if (run_production == TRUE) {
+    
+    #send the email to folks on the production distribution list
+    email_to <-   readxl::read_excel(paste0(FILEDIR,"Notification_distribution_list.xlsx"),trim_ws = T)  %>%
+      mutate(email_address = textclean::strip(email_address,
+                                              char.keep = c( "@", ".", "-"),
+                                              digit.remove = F,
+                                              apostrophe.remove = T,
+                                              lower.case = F),
+             email_address = glue::glue("<{email_address}>"))
+    
+  } else if (run_test == TRUE) { 
+    
+    #send the email to folks on the DIQA only distribution list
+    email_to <-   readxl::read_excel(paste0(FILEDIR,"Notification_distribution_list_DIQA.xlsx"),trim_ws = T)  %>%
+      mutate(email_address = textclean::strip(email_address,
+                                              char.keep = c( "@", ".", "-"),
+                                              digit.remove = F,
+                                              apostrophe.remove = T,
+                                              lower.case = F),
+             email_address = glue::glue("<{email_address}>")) 
+    
+  }
+  
+  rl <- sprintf(c(email_to$email_address))
+  
+  #subject
+  display_date <- as.character(Sys.Date(), format = '%m-%d-%y')
+  subj <- glue::glue("The COVID-19 R Objects are Updated, {as.character(Sys.Date(), format ='%m-%d-%y')}")
+  
+  
+  # Make the email body - updates to the text of the email go here if needed
+  # conditional for body of the email
+  
+  message_body <-
+    glue::glue(
+      "Good Morning,
+
+This is an automatic email notification that the COVID-19 surveillance R objects have been updated and are available in this folder: 
+
+filepath/
+
+* {one_pager_text}
+* {cc_dd_text}
+
+--------------------------------------
+# **QA Report Summary**
+
+
+**covid cases R object:**
+-------------------
+* {current_ICD_text}
+* {added}
+* {dropped}
+
+
+{output_table_email}
+
+
+The plots below shows the distribution of investigation create dates (top) and specimen collection dates (bottom) for cases which were newly added to the object. The ICD plot is used to determine when cases were created since the previous run and show how old those specimens are.
+
+{monday_plots_image}
+
+---- **Dashboard Check** 
+* {case_1week_added}
+* {hosp_1week_added}
+* {death_1week_added}
+
+
+---- **Roster Data** 
+* The RHINO roster finished uploading at {rhino_time$rhino_time}
+* The death roster was last uploaded on {death_time$death_time}
+* The sequencing roster finished uploading at {sequencing_time$sequencing_roster} and was pulled at {sequencing_time$pull}
+* The COVID-19 flattened table refreshed at {flat_qa$wdrs_flat_time}
+* The COVID-19 lab table refreshed at {lab_qa$lab_table_time}
+
+    
+---- **Submitter Data** 
+* {submitter_text}
+    
+{submitter_table_email}
+    
+    
+---- **Script Run Time**
+* {runtime}
+
+---- **Notes:**
+* Sequencing roster data is only uploaded on Mon/Tue/Wed. If Monday is a holiday, it will be uploaded on Tuesday.
+* Death roster data is only uploaded on Tuesday afternoons. After switching to weekly COVID-19 R object cadence, death data will lag in the object by one week.
+
+
+--------------------------------------
+**geocoded covid cases R object:**
+-------------------
+
+{gcc_QA_message}
+
+
+--------------------------------------
+
+To subscribe/unsubscribe to these notifications, you can add/remove your email address from the distribution list found here:
+
+filepath.xlsx
+
+Thanks,
+
+DIQA Team
+
+
+ps - I'm a bot, bleep bloop"
+    )
+  
+  
+  
+  email <- blastula::compose_email(body = blastula::md(message_body))
+  
+  email %>%
+    smtp_send(
+      to = rl,
+      from = f,
+      subject = subj,
+      credentials = creds_key(id = "relay")
+    )
+  
+} else {
+  
+  #from
+  f <- sprintf("<your.email@email.com>")
+  
+  #send the email only to integration team folks on the distribution list
+  email_to <-   readxl::read_excel(paste0(FILEDIR,"Notification_distribution_list_DIQA.xlsx"),trim_ws = T)  %>%
+    mutate(email_address = textclean::strip(email_address, char.keep = c( "@", ".", "-"), digit.remove = F, apostrophe.remove = T, lower.case = F),
+           email_address = glue::glue("<{email_address}>"))
+  
+  integration_team <- email_to %>% filter(DIQA_integration_team_member=='Yes')
+  
+  rl <- sprintf(c(integration_team$email_address))
+  
+  #subject
+  display_date <- as.character(Sys.Date(), format = '%m-%d-%y')
+  subj <- glue::glue("ATTENTION: Issue with the COVID-19 R objects, {as.character(Sys.Date(), format ='%m-%d-%y')}")
+  
+  #body - any additional information can be added to this email by wrapping vectors in {} below
+  email_body <- glue::glue(
+    "Good morning DIQA, 
+  
+  Something went wrong this morning with the COVID-19 R objects and the regular email notification can't be sent. Check the logs for details.
+  
+  Best,
+  DIQA Team")
+  
+  # Send email
+  ## NOTE- if you want to override the distribution list "to" (for a test), replace the "to=rl" with "to="emailyouwant""
+  email %>%
+    smtp_send(
+      to = rl,
+      from = f,
+      subject = subj,
+      credentials = creds_key(id = "relay")
+    )
+  
+}
+```

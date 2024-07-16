@@ -1,0 +1,820 @@
+#################################################################################################
+#  QUALITY ASSURANCE CHECK FOR COVID CASES DATASET CREATION
+#  COVID-19 R OBJECT DATASET CREATION AND CLEANING PART 6
+################################################################################################
+################################################################################################
+#
+#  This R Markdown script loads in R packages, pulls in previously created COVID cases and GEOCODED cases datasets to check for quality issues that can 
+#  be fixed or addressed, in order to ultimately create clean, static COVID-19 datasets in the form of .Rdata files, referred to 
+#  as R Objects. The R Objects are created as an alternative for querying the live (and therefore, more complex and messy) Washington COVID-19 database. 
+#  
+#
+#  **IMPORTANT ACRONYMS/PHRASES USED:**
+#     -WDRS: Washington Disease Reporting System (the primary database for COVID-19 disease reporting information)
+#     -db: database
+#     -df: dataframe; a way to structure data within the base functions of R
+#     -R Object: a set of .RData files with cleaned COVID-19 data to use as a more reliable/static dataset to pull data from compared to the live databse WDRS 
+#     -spectable: a table looking at specimen collection specifically
+#     -QA: quality assurance
+#
+#
+#  This script is helpful to external DOH partners as it demonstrates how to create a standardized dataset for all cases to use as an alternative to querying a live database.
+#  
+################################################################################################
+################################################################################################
+
+
+---
+  title: " DIQA R Object Report"
+author: "DIQA team"
+date: " `r as.character(Sys.Date(), format = '%A %B %d, %Y') `"
+output: 
+  html_document:
+  toc: true
+mathjax: null
+self_contained: no
+---
+  
+  #add this to basic document
+  rmarkdown::render('QA_checks.Rmd',
+                    output_file=paste0(paste(scriptrun, day, "QA_Report", sep='_'),'.html'))
+
+```{r setup5, include=FALSE}
+knitr::opts_chunk$set(echo = TRUE,root.dir = '/tmp')
+```
+
+```{css, echo=FALSE}
+# .container-fluid.main-container{
+# max-width: 85%
+# }
+# .tabset{
+#     display: flex;
+#     float: left;
+# 
+# }
+# .tab button {
+#   display: block;
+#   background-color: inherit;
+#   color: black;
+#   padding: 22px 16px;
+#   width: 100%;
+#   border: none;
+#   outline: none;
+#   text-align: left;
+#   cursor: pointer;
+#   transition: 0.3s;
+# }
+# 
+# .nav.nav-pills {
+#     flex: 15%;
+#     width: 100%;
+# }
+# .nav.nav-pills li{
+#     width: 100%;
+# }
+# .tab-content{
+#     flex: 85%;
+#     width: 100%
+# }
+# .btn {
+#     border-width: 0 0px 0px 0px;
+#     font-weight: normal;
+#     text-transform: ;
+# }
+# .btn-default {
+#     color: #2ecc71;
+#     background-color: #ffffff;
+#     border-color: #ffffff;
+# }
+
+```
+
+# Manual load set-up
+If this code needs to be run as a stand alone code, and not as part of the script, please change the following chunk to EVAL=TRUE. 
+```{r, eval=FALSE}
+
+#manual package load
+if(!require("pacman")) install.packages("pacman")
+p_load(haven, tidyverse, tidyverse, data.table, janitor, lubridate, RSQLite,
+       DBI, odbc, readxl, here, fs, taskscheduleR, kableExtra, dplyr, gridExtra, blastula)
+
+#path set up
+GITDIR <-"filepath"
+Output_tables_wdrs<-"filepath"
+diqa_path <- "filepath"
+Output_tables_wdrs_excel<-"filepath"
+BASEDIR<- "filepath"
+FILEDIR <- "filepath" 
+
+#load required databases
+load(paste0(Output_tables_wdrs, "covid_cases.RData"))
+load(paste0(diqa_path, "SpecTable.RData"))
+setDT(covid_cases)
+setDT(SpecTable)
+
+#load required QA objects
+load(paste0(GITDIR, "QA_Report/QA_objects/duplicate.RData"))
+load(paste0(GITDIR, "QA_Report/QA_objects/duplicate_new.RData"))
+load(paste0(GITDIR, "QA_Report/QA_objects/sequencing_time.RData"))
+load(paste0(GITDIR, "QA_Report/QA_objects/gcc_QA_message.RData"))
+
+#connect to wdrs for sequencing time pulls
+wdrs <- DBI::dbConnect(odbc::odbc(),
+                       Driver = "Installed_SQL_Driver_here",
+                       Server = "server_name_here",
+                       Database = "Database_name_here",
+                       Trusted_connection = "yes",
+                       ApplicationIntent= "ReadOnly")
+
+#loadR function
+loadRData <- function(fileName){
+  load(fileName)
+  get(ls()[ls() != "fileName"])
+}
+
+#general use date objects
+currentDate <- gsub(":", ".", Sys.time(), fixed = TRUE)
+datetimestamp<- gsub(":", ".", Sys.time(), fixed = TRUE)
+
+#set the day of the week manually
+day_check <- "Wed"
+
+```
+
+This code runs several QA checks of the data that then get incorporated into the morning and afternoon QA HTML output as well as the e-mail sent to all users.
+
+# covid_cases QA checks
+below are the QA checks run on covid_cases. 
+
+```{r prep_objects}
+
+setDT(covid_cases)
+setDT(SpecTable)
+
+```
+
+Load covid_cases objects for QA purposes. Objects are sorted by File name so as to avoid any files which downstream users may have manipulated and changed the mtime for.
+```{r load_QA_cc}
+
+#Pull in the previous QA covid_cases snapshot
+#pulls a list of all files in the given folder - should be changed if running a test
+files <- list.files(path = "filepath",full.names=T)
+
+
+# Select the data from the most recently updated covid_cases
+file_cleaned <- cbind(
+  file.info(files)[,c("size"), drop=FALSE], #file.info collects file information, but only file path, name, and size are being kept
+  x = as.character(file.mtime(files))) %>% #binding those^ to mtime and separating into 2 columns date and time
+  separate(x,
+           into = c("DateModified","TimeModified"),
+           sep=" ") %>%
+  rownames_to_column %>%
+  mutate(DateModified = as.Date(DateModified),TimeModified = as.numeric(hms(TimeModified)))%>% #changing class of variables
+  dplyr::select(DateModified,
+                TimeModified,
+                Size=size,
+                FileName=rowname)%>%
+  arrange(desc(FileName)) %>%
+  head()
+
+#pull in the covid_cases file from the previous QA run (this should always be true as no users should be accessing this folder)
+prev_data <- paste0(file_cleaned$FileName[2],"/covid_cases.RData")
+prev_covid <- setDT(loadRData(prev_data))
+prev_data_date <- substring(prev_data, 144,153) #file path should always be the same length, may be more reliable than modified date if users manipulate objects
+
+#alternative way to do the above, but would have to re-order to place prior to saving the current QA covid_cases
+# files_mtime <- file.mtime(files)
+# today.file <- files[which.max(files_mtime)]
+# prev_data <- paste0(today.file,"/covid_cases.RData")
+# prev_covid <- setDT(loadRData(prev_data))
+
+
+# This removes all cases without an INVESTIGATION_CREATE_DATE############################
+prev_covid <- prev_covid[!(is.na(INVESTIGATION_CREATE_DATE))]
+
+covid_cases <- covid_cases[!(is.na(INVESTIGATION_CREATE_DATE))]
+
+# Create range of Investigation Create dates which should be used for QA checks
+prev_ICD <- max(prev_covid$INVESTIGATION_CREATE_DATE)
+current_ICD <- max(covid_cases$INVESTIGATION_CREATE_DATE)
+diff_ICD <- current_ICD - prev_ICD
+
+current_ICD_text <- paste0("This database update contains cases created up to ", current_ICD, ".")
+
+current_ICD_text
+
+#if running this multiple times in a single day, may need some sort of failsafe otherwise QA report will produce 0 changes
+if (diff_ICD < 1) {
+  diff_ICD = 1
+}
+
+```
+
+
+## COVID-19 R objects QA Report {.tabset .tabset-fade}
+
+
+### Submitter info
+The code below checks if there are cases that appeared in the WDRS database since the previous pull, but have a specimen collection date of more than 10 days before today. This means that there was a delay in submitting the results into the WDRS or ELR system. Submitter_table and submitter_text summarize where those delayed cases come from, and are called into the e-mails and QA report. In January 2023, added two additional fields to flag the earliest and latest submission date(s) from each submitter
+```{r covid_cases submitter, echo=FALSE, fig.height=5, fig.width=15, message=FALSE, warning=FALSE}
+
+#filter cases which were added to WDRS and covid_cases object from the previous pull
+ncovid = covid_cases[, .(SPECIMEN__COLLECTION__DTTM,CASE_ID, INVESTIGATION_CREATE_DATE,FIRST_NAME,LAST_NAME)
+][INVESTIGATION_CREATE_DATE >= Sys.Date() - diff_ICD]
+
+#filter cases which were added to WDRS and  covid_cases object from the previous pull but had SCD greater than 10 days from today
+ncovid2 = ncovid[SPECIMEN__COLLECTION__DTTM < Sys.Date() - 10]
+
+
+
+SUB = SpecTable[WDRS__RESULT__SUMMARY == "Positive" & WDRS__RESULT %in% c('SARS-CoV-2 (virus causing COVID-19) detected',
+                                                                          "SARS-CoV-2 (virus causing COVID-19) antigen detected")
+][WDRS__TEST__PERFORMED %in% c("PCR/Nucleic Acid Test (NAT, NAAT, DNA)", "RT-PCR",
+                               "Antigen by Immunoassay (respiratory specimen)",
+                               "Fluorescent immunoassay (FIA)")
+][, .(SUBMITTER, CASE_ID, INVESTIGATION_CREATE_DATE, SPECIMEN__COLLECTION__DTTM, ORDFAC__NAME)
+][, INVESTIGATION_CREATE_DATE := as.Date(INVESTIGATION_CREATE_DATE, format = "%m/%d/%Y")
+][!is.na(SUBMITTER)] %>% distinct()
+
+
+SUB2 = SUB[ncovid2, on = .(CASE_ID, SPECIMEN__COLLECTION__DTTM, INVESTIGATION_CREATE_DATE)]
+
+
+submitter_table <- setorder(`SUB2`[, .(n = .N, earliest_collection = min(SPECIMEN__COLLECTION__DTTM), latest_collection = max(SPECIMEN__COLLECTION__DTTM)),
+                                   keyby = .(SUBMITTER)
+][, `:=`(Percent = round(n/nrow(..SUB2) * 100))], -n, na.last = TRUE) %>% adorn_totals("row") %>% data.frame()  
+
+
+submitter_count <- data.frame(SUBMITTERN = c(nrow(ncovid2),
+                                             nrow(ncovid),
+                                             round((nrow(ncovid2)/nrow(ncovid)*100), 2)))
+
+submitter_text <- paste0("There are ", submitter_count$SUBMITTERN[1], " new covid cases (",submitter_count$SUBMITTERN[3],"%) in the database that have specimen collection dates from more than 10 days ago.")
+
+submitter_text
+
+submitter_table %>%
+  kbl (caption = submitter_text, col.names=c("Submitter", "N", "Earliest collection date", "Latest collection date", "Percent")) %>%
+  kableExtra::kable_styling()
+```
+
+# Compare dropped cases
+The WDRS is continuously updated and changed. Front-end users can edit data after entering it, and several deduplication and cleaning processes happen that are both manual and automated. Therefore, cases that were in a report on a previous day, may be removed in a future report. The code below checks how many cases were dropped since the previous report was run, and this is reported in the QA report. The object "holidays" and all of the objects and functions to determine what day we are on are included in the "load_packages.R" script.
+
+```{r dropped cases, include=FALSE}
+
+# Difference in cases from current report and previously run report
+case_difference <- nrow(covid_cases) - nrow(prev_covid)
+
+
+# CASE IDs that are in the previous snapshot but not the current snapshot
+removed_cases <- prev_covid[!covid_cases, on = .(CASE_ID)
+][, .(CASE_ID, County)]
+
+
+#new covid cases - filter cases which were added to WDRS and covid_cases object from the previous pull
+#not focusing on any new CASE_IDs added to the covid_cases object (some are very old and added through deduplication, etc.)
+#focusing on CASE_IDs that were added to WDRS, NOT all CASE_IDs which were changed
+covid_new <- covid_cases[INVESTIGATION_CREATE_DATE >= Sys.Date() - diff_ICD]
+
+
+# Done to determine how many cases were added or removed (reconciled) by county
+Counties_reconciled <- removed_cases[, .(`Number of Cases Removed Since prev` = .N), keyby = .(County)]
+
+Counties_new_cases <- covid_new[, .(CASE_ID, County)
+][, .(`Number of New Cases Added` = .N), keyby = .(County)]
+
+change_by_county <- merge(Counties_new_cases, Counties_reconciled, all = TRUE)
+
+
+#replace NA values
+change_by_county$County[is.na(change_by_county$County)] <- "Unassigned County"
+change_by_county[is.na(change_by_county)] = 0
+
+
+#add a final row with totals
+change_by_county <- change_by_county %>%
+  adorn_totals(where = "row")
+
+names(change_by_county) <-
+  c("County",
+    "Number of New Cases Added",
+    "Number of Cases Dropped")
+
+
+#do a check back to the object from last week to check changes in case, hospitalization, and death counts
+
+#save QA snapshot of current counts of cases, hospitalizations,and deaths as a separate QA object
+dashboard_count <- data.frame(Dashboard_N = c(nrow(covid_cases),
+                                              nrow(covid_cases[mhosp == "Yes"]),
+                                              nrow(covid_cases[CovidDeath == "Yes"])),
+                              row.names = c("Cases", "Hospitalizations", "Deaths"))
+
+
+# Save QA snapshot of summary counts from covid_cases object 
+
+out_directory_folder_diqa <-paste0(FILEDIR,"QA_Report/DashboardChecks/",datetimestamp) # output file location path
+dir.create(out_directory_folder_diqa) # Generate the output folder
+save(dashboard_count, file = paste0(out_directory_folder_diqa, "/dashboard_count.RData"))
+
+#will be removed once in production
+files_wed <- list.files(path = paste0(FILEDIR,"QA_Report/DashboardChecks/") ,full.names=T)
+
+# Select the data from the most recently updated covid_cases
+file_wed_cleaned <- cbind(
+  file.info(files_wed)[,c("size"), drop=FALSE], #file.info collects file information, but only file path, name, and size are being kept
+  x = as.character(file.mtime(files_wed))) %>% #binding those^ to mtime and separating into 2 columns date and time
+  separate(x,
+           into = c("DateModified","TimeModified"),
+           sep=" ") %>%
+  rownames_to_column %>%
+  mutate(DateModified = as.Date(DateModified),TimeModified = as.numeric(hms(TimeModified)))%>% #changing class of variables
+  dplyr::select(DateModified,
+                TimeModified,
+                Size=size,
+                FileName=rowname)%>%
+  arrange(desc(FileName)) %>%
+  head()
+
+
+#pull in the covid_cases file from last Wednesday's QA run (this should always be true as no users should be accessing this folder)
+prev_data_1week <- paste0(file_wed_cleaned$FileName[2],"/dashboard_count.RData")
+prev_covid_1week <- loadRData(prev_data_1week)
+
+#calculate changes in cases, deaths, and hospitalizations
+case_difference_1week <- dashboard_count$Dashboard_N[1] - prev_covid_1week$Dashboard_N[1]
+
+hosp_difference_1week <- dashboard_count$Dashboard_N[2] - prev_covid_1week$Dashboard_N[2]
+
+death_difference_1week <- dashboard_count$Dashboard_N[3] - prev_covid_1week$Dashboard_N[3]
+
+#Write statement which will go into email (easier to write it here once, than many times in the email script)
+case_1week_added <- paste0("Today's covid_cases object has a net difference of ", case_difference_1week," case(s) since last Tuesday.")
+
+hosp_1week_added <- paste0("Today's covid_cases object has a net difference of ", hosp_difference_1week," hospitalization(s) since last Tuesday.")
+
+death_1week_added <- paste0("Today's covid_cases object has a net difference of ", death_difference_1week," death(s) since last Tuesday.")
+
+
+```
+## Reason cases were dropped
+The code below looks for reasons that cases appeared in yesterday's pull but not today. It pulls a table from WDRS (IDS_CASE_HISTORY) that logs various changes to cases in the system, and puts the reason for change in the "MESSAGE" field. Check if cases missing from R objects are in the "old_case_id" list. If so, look at CASE_DROPPED_REASON. 
+* The WDRS connection for this pull is established in the "wdrs_pull_" code script. 
+* Changes and deletions are usually made fairly quickly, so the code below only pulls the prior WEEK of data. 
+
+Some code is only run if the "morning script" is run, and other parts are only done if the "afternoon script" is run. Therefore, there are if statements, utilizing the wday(today()) logic, in which Mon=2, Tue=3, Wed=4, Thur=5, Fri=6. If the cadence of the morning and afternoon scripts change, these filters should be updated.
+**NOTE**Update the connection name here!!
+```{r reason_dropped_code, echo=FALSE, fig.height=5, fig.width=15, message=FALSE, warning=FALSE}
+#pull the list of case ID histories for the past week
+id_history_full <- setDT(dbGetQuery(
+  wdrs,
+  "
+                              SELECT CREATE_DATE, MESSAGE, CASE_ID, ORIGINAL_CASE_ID, EVENT_TYPE
+                              FROM [dbo].[IDS_CASE_HISTORY]
+                              WHERE CREATE_DATE > getdate()-7"))
+
+
+#there are some non English standard characters here so need to update them, and then rename variables and create a "case_dropped_reason" column
+case_history <- setnames(copy(`id_history_full`)[, `:=`(MESSAGE = iconv(MESSAGE, "", "ASCII", sub = ""))],
+                            c("CASE_ID", "ORIGINAL_CASE_ID"),
+                            c("FLATTENED_UNID", "FLATTENED_CASE_ID"))[, `:=`(case_dropped_reason = fcase(str_detect(MESSAGE, "Case merged"), "Deduplicated",
+                                                                                                         str_detect(MESSAGE, "Deleted"), "Deleted"),
+                                                                             DEDUP_CASE_ID = fcase(str_detect(MESSAGE, "Case merged"), substr(MESSAGE, 23, 31)))]
+
+# A WDRS pull is necessary here to get cases marked for deletion (STATUS = 6)
+# These cases are excluded from the GCD_COVID_19raw pull and are unavailable
+# in that object
+
+wdrs_flat <- setDT(dbGetQuery(wdrs, "
+                    SELECT DISTINCT CASE_ID, REPORTING_STATE, COUNTY, STATUS, ACCOUNTABLE_COUNTY, POSITIVE_PCR_EXISTS_COVID19, POSITIVE_AG_EXISTS_COVID19
+
+                    FROM [dbo].[DD_GCD_COVID_19_FLATTENED]"))
+
+
+#the code below returns cases that are in GCD_COVID_19, were in the previous covid_cases document, but not in the current object
+#These cases are those that are still in WDRS, but were filtered out of the covid_cases.R object for today
+#create a variable for reason dropped, based on vars available in GCD_COVID19_raw
+#STATUS 0 = active, 3 = closed, 6 = deleted
+
+inner <- removed_cases[wdrs_flat, on = .(CASE_ID), nomatch = NULL
+                             ][, `:=`(len_state = nchar(REPORTING_STATE))
+                               ][, `:=`(case_dropped_reason = fcase(len_state > 2, "Reporting State has issues",
+                                                                    ACCOUNTABLE_COUNTY == "WA-99", "Out of State",
+                                                                    (REPORTING_STATE != c("WA") & !is.na(REPORTING_STATE)), "Out of State",
+                                                                    STATUS == 6, "Deleted Status",
+                                                                    POSITIVE_PCR_EXISTS_COVID19 == "NO" & POSITIVE_AG_EXISTS_COVID19 == "NO", "Negative PCR & AG Test"))
+                                 ][, .(CASE_ID, case_dropped_reason)
+                                   ][, `:=`(MESSAGE_ICH = "N/A -- Found in GCD_COVID_19raw")]
+
+
+
+#Now, get the cases that were removed completely from the flattened table
+#this is also equivalent to an anti-join between removed_cases and inner if we ever need to speed this process up.
+
+anti <- removed_cases[!wdrs_flat, on = .(CASE_ID)]
+
+
+#For those that are no longer in the flattened table, join by case_history to see if they were deduplicated as a reason for removal
+#code below pulls cases that were removed, 
+
+dedup <- case_history[anti, on = c('DEDUP_CASE_ID' = 'CASE_ID'), nomatch = 0
+                            ][, .(FLATTENED_CASE_ID, case_dropped_reason, MESSAGE)] %>%
+    dplyr::rename(CASE_ID = FLATTENED_CASE_ID,
+          MESSAGE_ICH = MESSAGE)
+
+#join where case_dropped_reason=='Deleted' and CASE_ID==current_case_id
+
+delete <- case_history[case_dropped_reason == 'Deleted'
+                             ][anti, on = c('FLATTENED_CASE_ID' = 'CASE_ID'), nomatch = 0
+                               ][, .(FLATTENED_CASE_ID, case_dropped_reason, MESSAGE)] %>%
+  dplyr::rename(CASE_ID = FLATTENED_CASE_ID,
+         MESSAGE_ICH = MESSAGE) %>%
+  distinct(CASE_ID, .keep_all = TRUE)
+  
+#merge dedup and deletes
+dedup_delete <- rbindlist(list(dedup, delete))
+
+dedup_delete$CASE_ID <- as.character(dedup_delete$CASE_ID)
+
+#prefinal to show full table of cases and why they were dropped
+prefinal <- rbindlist(list(dedup_delete, inner))
+
+#creation of output_table which summarizes reasons for cases being dropped (deduped or deleted or change in test type)
+
+output_table <- prefinal[, .(n = .N), keyby = .(case_dropped_reason)]  %>%
+  adorn_totals("row")
+  
+added <- paste0(change_by_county$`Number of New Cases Added`[which(change_by_county$County=="Total")]," new case(s) added to previous covid_cases object from ", prev_data_date,".")
+
+dropped <- paste0(change_by_county$`Number of Cases Dropped`[which(change_by_county$County=="Total")]," CASE_ID(s) dropped from previous covid_cases object from ", prev_data_date,".")
+
+names(output_table) <- c("Reason","Count")
+
+output_table %>%
+  kbl(caption = paste0(change_by_county$`Number of Cases Dropped`[which(change_by_county$County=="Total")], " CASE_ID(s) dropped from previous covid_cases object.\n", "*Note- prefinal dataset has full linelist of dropped\n",added)) %>%
+  kable_styling()
+
+miss <- prefinal[is.na(case_dropped_reason)]
+
+miss %>%
+  kbl(caption = "List of CASE_ID(s) that have NA dropped Reason")%>%
+  kable_styling()
+
+## Run a QA check for the log
+if (change_by_county$`Number of Cases Dropped`[which(change_by_county$County == "Total")] > 0) {
+  print(paste0(
+    change_by_county$`Number of New Cases Added`[which(change_by_county$County == "Total")],
+    " new case(s) added to previous covid_cases object."
+  ))
+  print(
+    paste0(
+      change_by_county$`Number of Cases Dropped`[which(change_by_county$County == "Total")],
+      " CASE_ID(s) dropped from previous covid_cases object.",
+      " Check the path below. Date should be date on which covid_cases object was previously created. If not, warn the others."
+    )
+  )
+  print(paste0(prev_data))
+  print(
+    paste0(
+      "Breakdown of why CASE_ID(s) were dropped. Check 'prefinal' dataframe for a complete list of case ids"
+    )
+  )
+  print(output_table)
+} else if (change_by_county$`Number of Cases Dropped`[which(change_by_county$County == "Total")] < 0) {
+  print("Negative CASE_ID(s) dropped. Something is wrong!")
+} else{
+  print("No CASE_ID(s) dropped from previous covid_cases object - All is good")
+  
+  files_mtime <- file.mtime(files)
+  today.file <- files[which.max(files_mtime)]
+  
+  print(paste0(today.file))
+  
+}
+
+```
+
+## New case date distributions
+
+The code below generates graphs which shows the specimen collection date and investigation create date distribution of newly added cases. The ICD code is run to show what cases were were created from the previous weekly run.
+```{r covid_cases new case date distribution, echo=FALSE, fig.height=5, fig.width=15, message=FALSE, warning=FALSE}
+
+scd_distrib <- covid_new[, .(CASE_ID, SPECIMEN__COLLECTION__DTTM)
+                           ][(SPECIMEN__COLLECTION__DTTM > (Sys.Date() - 30))]
+
+scd_count_excl <- nrow(covid_new[, .(CASE_ID, SPECIMEN__COLLECTION__DTTM)
+                           ][(SPECIMEN__COLLECTION__DTTM < (Sys.Date() - 30))])
+
+scd_distrib_tab <- scd_distrib[, .(`Freq` = .N), keyby = .(SPECIMEN__COLLECTION__DTTM)
+                               ][(SPECIMEN__COLLECTION__DTTM > (Sys.Date() - 30))] %>% data.frame()
+
+
+scd_distrib_plot <- ggplot(data = scd_distrib_tab, aes(x = SPECIMEN__COLLECTION__DTTM, y = Freq)) +
+  geom_col(colour = "black",
+           fill = "#3069B2") + 
+  geom_text(aes(label = Freq), vjust = -0.2, colour = "black") +
+  #scale_fill_manual(values= wes_palette("Chevalier1")) +
+  labs(x = "Specimen Collection Date",
+       y = "Count",
+       title = "Specimen Collection Date of New Cases",
+       subtitle = paste0(currentDate),
+       caption = paste0("Note: only contains cases with SCDs from the last 30 days; ", scd_count_excl," new cases are excluded from this graph")) #+
+  # theme(plot.title = element_text(hjust = 0.5),
+  #       plot.subtitle = element_text(hjust = 0.5))
+
+scd_distrib_plot
+
+# Prepare the image (as a text input)
+scd_distrib_image <- add_ggplot(scd_distrib_plot, width = 7, height = 5)
+
+# ICD distribution visualization - no longer conditional (4/19/2024)
+icd_distrib <- covid_new[, .(CASE_ID, INVESTIGATION_CREATE_DATE, SPECIMEN__COLLECTION__DTTM)
+][, Old_Case := fcase(SPECIMEN__COLLECTION__DTTM < (Sys.Date() - 10), "Case with collection date > 10 days old",
+                      SPECIMEN__COLLECTION__DTTM >= (Sys.Date() - 10), "Case with collection date <= 10 days old")]
+
+icd_count_excl <- nrow(covid_new[, .(CASE_ID, INVESTIGATION_CREATE_DATE, SPECIMEN__COLLECTION__DTTM)
+][(INVESTIGATION_CREATE_DATE < (Sys.Date() - 30))])
+
+icd_distrib_tab <- icd_distrib[, .(`Freq` = .N), keyby = .(INVESTIGATION_CREATE_DATE, Old_Case)
+][(INVESTIGATION_CREATE_DATE > (Sys.Date() - 30))] %>% data.frame()
+
+
+icd_distrib_plot <- ggplot(data = icd_distrib_tab, aes(x = INVESTIGATION_CREATE_DATE, y = Freq, fill = Old_Case)) +
+  geom_col(colour = "black",
+           width = 0.3) + 
+  geom_text(aes(label = Freq), vjust = -0.2, colour = "black") +
+  scale_fill_manual(values = c("#932A6E", "#819556")) +
+  labs(x = "Investigation Create Date",
+       y = "Count",
+       title = "Investigation Create Date of New Cases",
+       subtitle = paste0(currentDate),
+       caption =  paste0("Note: only contains cases with ICDs from the last 30 days; ",
+                         icd_count_excl," new cases are excluded from this graph")) +
+  theme(legend.position = "top",
+        legend.title = element_blank())
+
+
+#+
+# theme(plot.title = element_text(hjust = 0.5),
+#       plot.subtitle = element_text(hjust = 0.5))
+
+icd_distrib_plot
+
+monday_plots <- grid.arrange(icd_distrib_plot, scd_distrib_plot, ncol = 1)
+
+# Prepare the image (as a text input)
+monday_plots_image <- add_ggplot(monday_plots, width = 7, height = 9)
+
+
+
+```
+
+
+```{r save compare cases and other QA objects, eval=TRUE}
+#Save the table to be pulled into the DIQA report
+save(output_table, file = paste0(GITDIR,"QA_Report/QA_objects/compare_dropped_cases.RData"))
+save(change_by_county, file = paste0(GITDIR, "QA_Report/QA_objects/change_by_county.RData"))
+
+
+#Pull the case_id's that have NA to be checked manually
+missing_drop_reason <- prefinal$CASE_ID[which(is.na(prefinal$case_dropped_reason))]
+save(missing_drop_reason, 
+     file = paste0(GITDIR, "QA_Report/QA_objects/missing_drop.RData"))
+
+
+#Save the table and yesterday case count from compare_dropped_cases
+save(prev_data, file = paste0(GITDIR, "QA_Report/QA_objects/yesterday_data.RData")) #CHECK DEPENDENCIES
+
+#save other QA objects
+save(prefinal, file = paste0(GITDIR, "QA_Report/QA_objects/prefinal.RData"))
+save(submitter_table, file = paste0(GITDIR, "QA_Report/QA_objects/submitter_table.RData"))
+save(submitter_count, file = paste0(GITDIR, "QA_Report/QA_objects/submitter_count.RData"))
+
+```
+
+# Roster update checks and timing
+The code below connects to the wdrs and then checks when the RHINO rosters and death rosters were last updated in the WDRS. The RHINO and death rosters are not always udpated in the morning report, and this pull time gets published in the QA e-mail so users now whether these two updated rosters made it into the database. Additionally, the time of each roster refresh for RHINO and death rosters is compared to the time that our script pulled the WDRS data (this object is produced in the "wdrs_pull" script. If the RHINO data was refreshed TODAY and BEFORE the pull occurred, "rhino_data_included" object = "Yes", and the same logic is applied to the death roster.
+                                                                                                                                                                                                                                                                                                                                                                                                                                                                           
+                                                                                                                                                                                                                                                                                                                                                                                                                                                                           The WDRS connection for this script is housed in the "wdrs_pull" script.
+                                                                                                                                                                                                                                                                                                                                                                                                                                                                           
+                                                                                                                                                                                                                                                                                                                                                                                                                                                                           ```{r roster update checks}
+                                                                                                                                                                                                                                                                                                                                                                                                                                                                           #pull in the flat time qa objects from the wdrs_pull script for comparison
+                                                                                                                                                                                                                                                                                                                                                                                                                                                                           load(paste0(GITDIR,"QA_Report/QA_objects/flat_qa.RData"))
+                                                                                                                                                                                                                                                                                                                                                                                                                                                                           #what time did RHINO finish? Gives the most recent RHINO roster, even if it was yesterday
+                                                                                                                                                                                                                                                                                                                                                                                                                                                                           rhino_time <- dbGetQuery(wdrs, 
+                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                    "SELECT top 1 create_date as rhino_time
+                  from IDS_EMAIL_QUEUE where subject 
+                  like '%Processing Module COVID-19 RHINO roster Completed%'
+                  order by email_date desc")
+                                                                                                                                                                                                                                                                                                                                                                                                                                                                           
+                                                                                                                                                                                                                                                                                                                                                                                                                                                                           
+                                                                                                                                                                                                                                                                                                                                                                                                                                                                           rhino_time$rhino_time <- force_tz(rhino_time$rhino_time , tzone= "America/Los_Angeles",roll = TRUE)
+                                                                                                                                                                                                                                                                                                                                                                                                                                                                           
+                                                                                                                                                                                                                                                                                                                                                                                                                                                                           #what time did death roster finish? Gives the most recent death roster, even if it was yesterday
+                                                                                                                                                                                                                                                                                                                                                                                                                                                                           death_time <- dbGetQuery(wdrs, 
+                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                    "SELECT top 1 create_date as death_time
+                  from IDS_EMAIL_QUEUE where subject 
+                  like '%Processing Module COVID-19 Death updates Completed%'
+                  order by email_date desc")
+                                                                                                                                                                                                                                                                                                                                                                                                                                                                           
+                                                                                                                                                                                                                                                                                                                                                                                                                                                                           
+                                                                                                                                                                                                                                                                                                                                                                                                                                                                           death_time$death_time <- force_tz(death_time$death_time, tzone= "America/Los_Angeles",roll = TRUE)
+                                                                                                                                                                                                                                                                                                                                                                                                                                                                           
+                                                                                                                                                                                                                                                                                                                                                                                                                                                                           #compare if rhino_time occurred TODAY and is it before wdrs_flat_time? If both are true, this means RHINO data is included in the R objects
+                                                                                                                                                                                                                                                                                                                                                                                                                                                                           rhino_data_included <- if_else(rhino_time$rhino_time < flat_qa$wdrs_flat_time &
+                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                            as.Date(rhino_time$rhino_time) == Sys.Date(), "Yes", "No")
+                                                                                                                                                                                                                                                                                                                                                                                                                                                                           
+                                                                                                                                                                                                                                                                                                                                                                                                                                                                           
+                                                                                                                                                                                                                                                                                                                                                                                                                                                                           #is sequencing_roster TODAY AND is it before wdrs_pull_time?
+                                                                                                                                                                                                                                                                                                                                                                                                                                                                           #note- the pull of "sequencing_time" is done in the *wdrs_pull_and_raw_object_save.Rmd* file
+                                                                                                                                                                                                                                                                                                                                                                                                                                                                           sequencing_data_included <- if_else(sequencing_time$sequencing_roster  < sequencing_time$pull &
+                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                 as.Date(sequencing_time$sequencing_roster ) == Sys.Date(), "Yes", "No")
+                                                                                                                                                                                                                                                                                                                                                                                                                                                                           
+                                                                                                                                                                                                                                                                                                                                                                                                                                                                           #print some things out for the log
+                                                                                                                                                                                                                                                                                                                                                                                                                                                                           rhino_data_included
+                                                                                                                                                                                                                                                                                                                                                                                                                                                                           sequencing_data_included
+                                                                                                                                                                                                                                                                                                                                                                                                                                                                           
+                                                                                                                                                                                                                                                                                                                                                                                                                                                                           rhino_time$rhino_time
+                                                                                                                                                                                                                                                                                                                                                                                                                                                                           death_time$death_time
+                                                                                                                                                                                                                                                                                                                                                                                                                                                                           flat_qa$wdrs_flat_time
+                                                                                                                                                                                                                                                                                                                                                                                                                                                                           sequencing_time$sequencing_roster 
+                                                                                                                                                                                                                                                                                                                                                                                                                                                                           
+                                                                                                                                                                                                                                                                                                                                                                                                                                                                           ```
+                                                                                                                                                                                                                                                                                                                                                                                                                                                                           ### RHINO/Death/Sequencing Roster
+                                                                                                                                                                                                                                                                                                                                                                                                                                                                           ```{r,echo=FALSE,warning=FALSE}
+                                                                                                                                                                                                                                                                                                                                                                                                                                                                           
+                                                                                                                                                                                                                                                                                                                                                                                                                                                                           
+                                                                                                                                                                                                                                                                                                                                                                                                                                                                           if(rhino_data_included=='Yes'){
+                                                                                                                                                                                                                                                                                                                                                                                                                                                                             rhino_text <- "Today's RHINO roster data is included in the R objects."
+                                                                                                                                                                                                                                                                                                                                                                                                                                                                           } else {
+                                                                                                                                                                                                                                                                                                                                                                                                                                                                             rhino_text <- "Today's RHINO roster data is NOT YET included in the R objects."
+                                                                                                                                                                                                                                                                                                                                                                                                                                                                           }
+                                                                                                                                                                                                                                                                                                                                                                                                                                                                           print(rhino_text)
+                                                                                                                                                                                                                                                                                                                                                                                                                                                                           
+                                                                                                                                                                                                                                                                                                                                                                                                                                                                           if(sequencing_data_included=="Yes"){
+                                                                                                                                                                                                                                                                                                                                                                                                                                                                             sequence_text<- "Today's sequencing roster data is included in the R objects."
+                                                                                                                                                                                                                                                                                                                                                                                                                                                                           } else {
+                                                                                                                                                                                                                                                                                                                                                                                                                                                                             sequence_text<- "Today's sequencing roster data is NOT YET included in the R objects."
+                                                                                                                                                                                                                                                                                                                                                                                                                                                                           }
+                                                                                                                                                                                                                                                                                                                                                                                                                                                                           print(sequence_text)
+                                                                                                                                                                                                                                                                                                                                                                                                                                                                           
+                                                                                                                                                                                                                                                                                                                                                                                                                                                                           
+                                                                                                                                                                                                                                                                                                                                                                                                                                                                           ifelse(
+                                                                                                                                                                                                                                                                                                                                                                                                                                                                             exists("death_time"), 
+                                                                                                                                                                                                                                                                                                                                                                                                                                                                             str_glue("The death roster finished uploading at {death_time$death_time}"),
+                                                                                                                                                                                                                                                                                                                                                                                                                                                                             'Wait until the afternoon update for the death roster status'
+                                                                                                                                                                                                                                                                                                                                                                                                                                                                           )
+                                                                                                                                                                                                                                                                                                                                                                                                                                                                           
+                                                                                                                                                                                                                                                                                                                                                                                                                                                                           ifelse(
+                                                                                                                                                                                                                                                                                                                                                                                                                                                                             exists("rhino_time"), 
+                                                                                                                                                                                                                                                                                                                                                                                                                                                                             str_glue("The RHINO roster finished uploading at {rhino_time$rhino_time}"),
+                                                                                                                                                                                                                                                                                                                                                                                                                                                                             'Wait until the afternoon update for the RHINO roster status'
+                                                                                                                                                                                                                                                                                                                                                                                                                                                                           )
+                                                                                                                                                                                                                                                                                                                                                                                                                                                                           
+                                                                                                                                                                                                                                                                                                                                                                                                                                                                           ifelse(
+                                                                                                                                                                                                                                                                                                                                                                                                                                                                             exists("flat_qa"), 
+                                                                                                                                                                                                                                                                                                                                                                                                                                                                             str_glue("The flattened table refreshed at {flat_qa$wdrs_flat_time}"),
+                                                                                                                                                                                                                                                                                                                                                                                                                                                                             'Wait until the afternoon update for the flattened table refresh time'
+                                                                                                                                                                                                                                                                                                                                                                                                                                                                           )
+                                                                                                                                                                                                                                                                                                                                                                                                                                                                           
+                                                                                                                                                                                                                                                                                                                                                                                                                                                                           ifelse(
+                                                                                                                                                                                                                                                                                                                                                                                                                                                                             exists("sequencing_time"), 
+                                                                                                                                                                                                                                                                                                                                                                                                                                                                             str_glue("The sequencing roster finished uploading at {sequencing_time$sequencing_roster} and was pulled at {sequencing_time$pull}"),
+                                                                                                                                                                                                                                                                                                                                                                                                                                                                             'Wait until the afternoon update for the sequencing roster status'
+                                                                                                                                                                                                                                                                                                                                                                                                                                                                           )
+                                                                                                                                                                                                                                                                                                                                                                                                                                                                           
+                                                                                                                                                                                                                                                                                                                                                                                                                                                                           ```
+                                                                                                                                                                                                                                                                                                                                                                                                                                                                           
+                                                                                                                                                                                                                                                                                                                                                                                                                                                                           ### WDRS Health Check
+                                                                                                                                                                                                                                                                                                                                                                                                                                                                           ```{r, echo=FALSE, fig.height=5, fig.width=15, message=FALSE, warning=FALSE}
+                                                                                                                                                                                                                                                                                                                                                                                                                                                                           
+                                                                                                                                                                                                                                                                                                                                                                                                                                                                           load(paste0(GITDIR,"QA_Report/QA_objects/flat_qa.RData"))
+                                                                                                                                                                                                                                                                                                                                                                                                                                                                           load(paste0(GITDIR,"QA_Report/QA_objects/lab_qa.RData"))
+                                                                                                                                                                                                                                                                                                                                                                                                                                                                           
+                                                                                                                                                                                                                                                                                                                                                                                                                                                                           #load yesterday's row counts
+                                                                                                                                                                                                                                                                                                                                                                                                                                                                           load(paste0(GITDIR,"QA_Report/QA_objects/yesterday_rows.RData"))
+                                                                                                                                                                                                                                                                                                                                                                                                                                                                           
+                                                                                                                                                                                                                                                                                                                                                                                                                                                                           flat_diff <- flat_qa$flat_rows - yesterday_rows$flat_rows
+                                                                                                                                                                                                                                                                                                                                                                                                                                                                           lab_diff <- lab_qa$lab_rows - yesterday_rows$lab_rows
+                                                                                                                                                                                                                                                                                                                                                                                                                                                                           
+                                                                                                                                                                                                                                                                                                                                                                                                                                                                           #Flattened Table 
+                                                                                                                                                                                                                                                                                                                                                                                                                                                                           ifelse(
+                                                                                                                                                                                                                                                                                                                                                                                                                                                                             exists("flat_qa"), 
+                                                                                                                                                                                                                                                                                                                                                                                                                                                                             str_glue("The COVID-19 flattened table refreshed at {flat_qa$wdrs_flat_time}"),
+                                                                                                                                                                                                                                                                                                                                                                                                                                                                             'Check the WDRS Health Check email for the status of the COVID-19 flattened table'
+                                                                                                                                                                                                                                                                                                                                                                                                                                                                           )
+                                                                                                                                                                                                                                                                                                                                                                                                                                                                           
+                                                                                                                                                                                                                                                                                                                                                                                                                                                                           
+                                                                                                                                                                                                                                                                                                                                                                                                                                                                           if (exists("flat_diff")) {
+                                                                                                                                                                                                                                                                                                                                                                                                                                                                             ifelse(flat_diff > 0,  str_glue("The flattened table has {flat_diff} more rows since the previous run."),
+                                                                                                                                                                                                                                                                                                                                                                                                                                                                                    ifelse(flat_diff == 0, str_glue("There are no new rows in the flattened table since the previous run. Is something wrong?"),
+                                                                                                                                                                                                                                                                                                                                                                                                                                                                                           ifelse(flat_diff < 0, str_glue("The flattened table has {(flat_diff*-1)} FEWER rows since the previous run. Something is wrong."),
+                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                  "Row difference for the flattened table could not be calculated. Check for errors."
+                                                                                                                                                                                                                                                                                                                                                                                                                                                                                           )
+                                                                                                                                                                                                                                                                                                                                                                                                                                                                                    )
+                                                                                                                                                                                                                                                                                                                                                                                                                                                                             )
+                                                                                                                                                                                                                                                                                                                                                                                                                                                                           } else {
+                                                                                                                                                                                                                                                                                                                                                                                                                                                                             print("Something went wrong when calculating the row difference for the flattened table. Check the logs.")
+                                                                                                                                                                                                                                                                                                                                                                                                                                                                           }
+                                                                                                                                                                                                                                                                                                                                                                                                                                                                           
+                                                                                                                                                                                                                                                                                                                                                                                                                                                                           
+                                                                                                                                                                                                                                                                                                                                                                                                                                                                           #Lab Table
+                                                                                                                                                                                                                                                                                                                                                                                                                                                                           ifelse(
+                                                                                                                                                                                                                                                                                                                                                                                                                                                                             exists("lab_qa"), 
+                                                                                                                                                                                                                                                                                                                                                                                                                                                                             str_glue("The COVID-19 lab table refreshed at {lab_qa$lab_table_time}"),
+                                                                                                                                                                                                                                                                                                                                                                                                                                                                             'Check the WDRS Health Check email for the status of the COVID-19 lab table'
+                                                                                                                                                                                                                                                                                                                                                                                                                                                                           )
+                                                                                                                                                                                                                                                                                                                                                                                                                                                                           
+                                                                                                                                                                                                                                                                                                                                                                                                                                                                           
+                                                                                                                                                                                                                                                                                                                                                                                                                                                                           
+                                                                                                                                                                                                                                                                                                                                                                                                                                                                           if (exists("lab_diff")) {
+                                                                                                                                                                                                                                                                                                                                                                                                                                                                             ifelse(lab_diff > 0,  str_glue("The lab table has {lab_diff} more rows since the previous run."),
+                                                                                                                                                                                                                                                                                                                                                                                                                                                                                    ifelse(lab_diff == 0, str_glue("There are no new rows in the lab table since the previous run. Is something wrong?"),
+                                                                                                                                                                                                                                                                                                                                                                                                                                                                                           ifelse(lab_diff < 0, str_glue("The lab table has {(lab_diff*-1)} FEWER rows since the previous run. Something is wrong."),
+                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                  "Row difference for the lab table could not be calculated. Check for errors."
+                                                                                                                                                                                                                                                                                                                                                                                                                                                                                           )
+                                                                                                                                                                                                                                                                                                                                                                                                                                                                                    )
+                                                                                                                                                                                                                                                                                                                                                                                                                                                                             )
+                                                                                                                                                                                                                                                                                                                                                                                                                                                                           } else {
+                                                                                                                                                                                                                                                                                                                                                                                                                                                                             print("Something went wrong when calculating the row difference for the lab table. Check the logs.")
+                                                                                                                                                                                                                                                                                                                                                                                                                                                                           }
+                                                                                                                                                                                                                                                                                                                                                                                                                                                                           
+                                                                                                                                                                                                                                                                                                                                                                                                                                                                           
+                                                                                                                                                                                                                                                                                                                                                                                                                                                                           
+                                                                                                                                                                                                                                                                                                                                                                                                                                                                           #save today's row counts for tomorrow
+                                                                                                                                                                                                                                                                                                                                                                                                                                                                           yesterday_rows <- cbind(flat_qa, lab_qa) %>% dplyr::select(flat_rows, lab_rows)
+                                                                                                                                                                                                                                                                                                                                                                                                                                                                           save(yesterday_rows, file =paste0(GITDIR,"QA_Report/QA_objects/yesterday_rows.RData"))
+                                                                                                                                                                                                                                                                                                                                                                                                                                                                           
+                                                                                                                                                                                                                                                                                                                                                                                                                                                                           
+                                                                                                                                                                                                                                                                                                                                                                                                                                                                           ```
+                                                                                                                                                                                                                                                                                                                                                                                                                                                                           
+                                                                                                                                                                                                                                                                                                                                                                                                                                                                           
+                                                                                                                                                                                                                                                                                                                                                                                                                                                                           ## output QA .csv files
+                                                                                                                                                                                                                                                                                                                                                                                                                                                                           ```{r QA csv outputs}
+                                                                                                                                                                                                                                                                                                                                                                                                                                                                           ##Checking the SPECIMEN__COLLECTION__DTTM for new covid cases by chunyi 01-26-2022
+                                                                                                                                                                                                                                                                                                                                                                                                                                                                           Report_dir <- paste0(GITDIR, "QA_Report/")
+                                                                                                                                                                                                                                                                                                                                                                                                                                                                           new_covid_date <-covid_new%>% group_by(SPECIMEN__COLLECTION__DTTM) %>% 
+                                                                                                                                                                                                                                                                                                                                                                                                                                                                             dplyr::summarize(N = n())%>% adorn_totals("row") %>% data.frame %>% mutate(Percent=N/nrow(covid_new))
+                                                                                                                                                                                                                                                                                                                                                                                                                                                                           csvFile <- paste(Report_dir, "New_Covid_SPECIMEN_Date",".csv", sep="")
+                                                                                                                                                                                                                                                                                                                                                                                                                                                                           data.table::fwrite(new_covid_date, csvFile)
+                                                                                                                                                                                                                                                                                                                                                                                                                                                                           
+                                                                                                                                                                                                                                                                                                                                                                                                                                                                           ##Checking the INVESTIGATION Date for new covid cases by chunyi 01-26-2022
+                                                                                                                                                                                                                                                                                                                                                                                                                                                                           new_covid_date2 <-covid_new%>% group_by(INVESTIGATION_CREATE_DATE) %>% dplyr::summarize(N = n())%>% adorn_totals("row") %>% data.frame
+                                                                                                                                                                                                                                                                                                                                                                                                                                                                           csvFile2 <- paste(Report_dir, "New_Covid_INVESTIGATION_Date",".csv", sep="")
+                                                                                                                                                                                                                                                                                                                                                                                                                                                                           data.table::fwrite(new_covid_date2, csvFile2)
+                                                                                                                                                                                                                                                                                                                                                                                                                                                                           
+                                                                                                                                                                                                                                                                                                                                                                                                                                                                           ##Checking the SPECIMEN__COLLECTION__DTTM for new covid cases by chunyi 01-27-2022
+                                                                                                                                                                                                                                                                                                                                                                                                                                                                           
+                                                                                                                                                                                                                                                                                                                                                                                                                                                                           csvFile3 <- paste(BASEDIR, "New_Case_Backlogs/New_Covid_SPECIMEN_Date_", currentDate,".csv", sep="")
+                                                                                                                                                                                                                                                                                                                                                                                                                                                                           data.table::fwrite(new_covid_date, csvFile3)
+                                                                                                                                                                                                                                                                                                                                                                                                                                                                           
+                                                                                                                                                                                                                                                                                                                                                                                                                                                                           
+                                                                                                                                                                                                                                                                                                                                                                                                                                                                           ##Write the submitter info in excel file by chunyi 03-18-2022
+                                                                                                                                                                                                                                                                                                                                                                                                                                                                           csvFile7 <- paste(BASEDIR, "Submitter/Submitter_", currentDate,".csv", sep="")
+                                                                                                                                                                                                                                                                                                                                                                                                                                                                           data.table::fwrite(SUB2, csvFile7)
+                                                                                                                                                                                                                                                                                                                                                                                                                                                                           
+                                                                                                                                                                                                                                                                                                                                                                                                                                                                           ```
+                                                                                                                                                                                                                                                                                                                                                                                                                                                                           # Timecheck
+                                                                                                                                                                                                                                                                                                                                                                                                                                                                           This report checks how long it takes to run the script. 
+                                                                                                                                                                                                                                                                                                                                                                                                                                                                           
+                                                                                                                                                                                                                                                                                                                                                                                                                                                                           ```{r timecheck}
+                                                                                                                                                                                                                                                                                                                                                                                                                                                                           if(exists("Start_update_WDRS") & exists("End_update_WDRS")){
+                                                                                                                                                                                                                                                                                                                                                                                                                                                                             time_point<-data.frame(Start_update_WDRS, 
+                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                    End_update_WDRS)
+                                                                                                                                                                                                                                                                                                                                                                                                                                                                             
+                                                                                                                                                                                                                                                                                                                                                                                                                                                                             time_checks<-time_point%>%
+                                                                                                                                                                                                                                                                                                                                                                                                                                                                               mutate(
+                                                                                                                                                                                                                                                                                                                                                                                                                                                                                 time_start_finish=End_update_WDRS-Start_update_WDRS)%>% 
+                                                                                                                                                                                                                                                                                                                                                                                                                                                                               dplyr::select(starts_with("time"))
+                                                                                                                                                                                                                                                                                                                                                                                                                                                                             
+                                                                                                                                                                                                                                                                                                                                                                                                                                                                             time_checks<-time_checks%>%
+                                                                                                                                                                                                                                                                                                                                                                                                                                                                               mutate(time_start_finish=paste(time_start_finish,units(time_checks$time_start_finish))
+                                                                                                                                                                                                                                                                                                                                                                                                                                                                               )
+                                                                                                                                                                                                                                                                                                                                                                                                                                                                             
+                                                                                                                                                                                                                                                                                                                                                                                                                                                                             
+                                                                                                                                                                                                                                                                                                                                                                                                                                                                             names(time_checks)<-c("Time to run the whole script")
+                                                                                                                                                                                                                                                                                                                                                                                                                                                                             
+                                                                                                                                                                                                                                                                                                                                                                                                                                                                             system_info<-Sys.info()
+                                                                                                                                                                                                                                                                                                                                                                                                                                                                             system_info<-system_info[4]
+                                                                                                                                                                                                                                                                                                                                                                                                                                                                             
+                                                                                                                                                                                                                                                                                                                                                                                                                                                                             runtime <- print(paste("Script run time -",script_runtime$End_update_WDRS,attr(script_runtime$End_update_WDRS,"units")))
+                                                                                                                                                                                                                                                                                                                                                                                                                                                                             save(runtime, file =paste0(GITDIR,"QA_Report/QA_objects/runtime.RData"))
+                                                                                                                                                                                                                                                                                                                                                                                                                                                                             
+                                                                                                                                                                                                                                                                                                                                                                                                                                                                             output_location<-paste0(BASEDIR,"DataRequests/update_wdrs_timechecks/","timecheck_",system_info,"_",format(Sys.time(),"%Y%m%d_%H%M"))
+                                                                                                                                                                                                                                                                                                                                                                                                                                                                             dir.create(output_location)
+                                                                                                                                                                                                                                                                                                                                                                                                                                                                             
+                                                                                                                                                                                                                                                                                                                                                                                                                                                                             csvFile8 <- paste0(output_location,"/process_time_",system_info,"_",format(Sys.time(),"%Y%m%d_%H%M"),".csv")
+                                                                                                                                                                                                                                                                                                                                                                                                                                                                             data.table::fwrite(time_checks, csvFile8, row.names = F)
+                                                                                                                                                                                                                                                                                                                                                                                                                                                                           } else {
+                                                                                                                                                                                                                                                                                                                                                                                                                                                                             paste("Start and end times not available. Either QA was run manually today or something else went wrong. Please check")
+                                                                                                                                                                                                                                                                                                                                                                                                                                                                           }
+                                                                                                                                                                                                                                                                                                                                                                                                                                                                           ```
+                                                                                                                                                                                                                                                                                                                                                                                                                                                                           
+                                                                                                                                                                                                                                                                                                                                                                                                                                                                           
+                                                                                                                                                                                                                                                                                                                                                                                                                                                                           #Disconnect from WDRS server 
+                                                                                                                                                                                                                                                                                                                                                                                                                                                                           Ongoing WDRS server connection issues in early 2023 are thought to be stemming from the database running out of ports for connection. DIQA will disconnect so as to not be a part of the problem.  
+                                                                                                                                                                                                                                                                                                                                                                                                                                                                           ```{r disconnect_from_wdrs}
+                                                                                                                                                                                                                                                                                                                                                                                                                                                                           
+                                                                                                                                                                                                                                                                                                                                                                                                                                                                           DBI::dbDisconnect(wdrs) 
+                                                                                                                                                                                                                                                                                                                                                                                                                                                                           
+                                                                                                                                                                                                                                                                                                                                                                                                                                                                           ```
